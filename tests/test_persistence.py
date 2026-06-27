@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 
-import os
-import tempfile
-import shutil
 import json
-import pytest
+import os
+import shutil
+import tempfile
+from unittest.mock import MagicMock, mock_open, patch
+
 import git
-from unittest.mock import patch, MagicMock, mock_open
+import pytest
+
 from persistence import PersistenceManager, SSHKeyManager
-from s3rn import S3RemoteFolder, S3RemoteDocument, S3RemoteCanvas, S3RemoteFile
+from s3rn import S3RemoteCanvas, S3RemoteDocument, S3RemoteFile, S3RemoteFolder
 
 
 class TestPathSanitization:
@@ -119,6 +121,15 @@ class TestResourceIndexManagement:
         assert index["canvas-456"]["type"] == "canvas"
         assert index["canvas-456"]["folder_id"] == "folder-789"
         assert index["canvas-456"]["path"] == "/canvas.canvas"
+
+    def test_rebuild_resource_index_public_api(self):
+        """Test public resource index rebuild API"""
+        self.persistence.resource_index[self.relay_id] = {}
+
+        self.persistence.rebuild_resource_index(self.relay_id)
+
+        assert "doc-123" in self.persistence.resource_index[self.relay_id]
+        assert "canvas-456" in self.persistence.resource_index[self.relay_id]
 
     def test_lookup_resource_document(self):
         """Test resource lookup returns correct S3RN objects"""
@@ -562,9 +573,9 @@ class TestSSHKeyManager:
         self.temp_dir = tempfile.mkdtemp()
 
         # Generate a test key for testing
+        from cryptography.hazmat.backends import default_backend
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
-        from cryptography.hazmat.backends import default_backend
 
         # Generate test private key
         private_key = rsa.generate_private_key(

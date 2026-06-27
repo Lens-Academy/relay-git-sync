@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 
-import os
 import hashlib
-import time
-import threading
 import logging
+import os
+import threading
+import time
 import traceback
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
 from pycrdt import Map
+
 from models import (
-    SyncOperation,
-    SyncType,
     OperationType,
+    SyncOperation,
     SyncRequest,
     SyncResult,
+    SyncType,
     create_document_resource_from_metadata,
 )
-from relay_client import RelayClient
 from persistence import PersistenceManager
-from s3rn import S3RNType, S3RN, S3RemoteFolder, S3RemoteDocument, S3RemoteFile, S3RemoteCanvas
+from relay_client import RelayClient
+from s3rn import S3RN, S3RemoteCanvas, S3RemoteDocument, S3RemoteFile, S3RemoteFolder, S3RNType
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +80,7 @@ class SyncEngine:
                 self.persistence_manager.filemeta_folders[relay_id][resource_id] = filemeta_dict
 
                 # Rebuild resource index since filemeta changed
-                self.persistence_manager._build_resource_index(relay_id)
+                self.persistence_manager.rebuild_resource_index(relay_id)
 
                 # Apply sync algorithm for folder changes
                 folder_operations = self.apply_remote_folder_changes(
@@ -91,6 +93,11 @@ class SyncEngine:
             else:
                 # This should be a document/canvas/file - lookup type from resource index
                 document_resource = self.persistence_manager.lookup_resource(relay_id, resource_id)
+
+                if document_resource is None:
+                    document_resource = self._refresh_filemeta_and_lookup_resource(
+                        relay_id, resource_id
+                    )
 
                 if document_resource is None:
                     # Debug info for unknown resource
@@ -109,7 +116,7 @@ class SyncEngine:
                                 )
 
                     print(
-                        f"Warning: Document {resource_id} not found in resource index - skipping update"
+                        f"Warning: Document {resource_id} not found in resource index after refreshing known folders - skipping update"
                     )
                     operations = []
                 else:
@@ -203,7 +210,7 @@ class SyncEngine:
                 self.persistence_manager.filemeta_folders[relay_id][folder_uuid] = filemeta_dict
 
                 # Rebuild resource index since filemeta changed
-                self.persistence_manager._build_resource_index(relay_id)
+                self.persistence_manager.rebuild_resource_index(relay_id)
 
                 # Apply sync algorithm for folder changes
                 folder_operations = self.apply_remote_folder_changes(
@@ -264,6 +271,40 @@ class SyncEngine:
             logger.error(f"Error processing sync request for {request.resource}: {e}")
             logger.error(f"Sync request processing traceback: {traceback.format_exc()}")
             return SyncResult(resource=request.resource, operations=[], success=False, error=str(e))
+
+    def _refresh_filemeta_and_lookup_resource(
+        self, relay_id: str, resource_id: str
+    ) -> Optional[S3RNType]:
+        """Refresh known folder filemeta, then retry resolving a resource."""
+        folder_ids = list(self.persistence_manager.filemeta_folders.get(relay_id, {}).keys())
+        if not folder_ids:
+            return None
+
+        refreshed_any = False
+
+        for folder_id in folder_ids:
+            try:
+                folder_resource = S3RemoteFolder(relay_id, folder_id)
+                doc = self.relay_client.get_doc_object(folder_resource)
+
+                if "filemeta_v0" not in doc.keys():
+                    logger.warning(
+                        f"Cannot refresh filemeta for folder {folder_id}: missing filemeta_v0"
+                    )
+                    continue
+
+                filemeta_content = doc.get("filemeta_v0", type=Map)
+                filemeta_dict = self.relay_client._map_to_dict(filemeta_content)
+                self.persistence_manager.filemeta_folders[relay_id][folder_id] = filemeta_dict
+                refreshed_any = True
+            except Exception as e:
+                logger.warning(f"Cannot refresh filemeta for folder {folder_id}: {e}")
+
+        if not refreshed_any:
+            return None
+
+        self.persistence_manager.rebuild_resource_index(relay_id)
+        return self.persistence_manager.lookup_resource(relay_id, resource_id)
 
     def sync_relay_all_folders(self, relay_id: str) -> List[SyncResult]:
         """CLI/API-triggered sync for all folders in a relay"""

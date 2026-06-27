@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
 
-import json
-import os
-import time
-import shutil
-import logging
-import traceback
-import signal
 import atexit
-import threading
 import glob
+import json
+import logging
+import os
+import shutil
+import signal
 import subprocess
-from typing import Dict, Any, Optional, List
+import threading
+import time
+import traceback
+from typing import Any, Dict, List, Optional
+
 import git
-from s3rn import (
-    S3RNType,
-    S3RN,
-    S3RemoteFolder,
-    S3RemoteDocument,
-    S3RemoteCanvas,
-    S3RemoteFile,
-    ResourceInterface,
-)
-from models import get_s3rn_resource_category
+
 from git_config import GitConnectorConfig
+from models import get_s3rn_resource_category
+from s3rn import (
+    S3RN,
+    ResourceInterface,
+    S3RemoteCanvas,
+    S3RemoteDocument,
+    S3RemoteFile,
+    S3RemoteFolder,
+    S3RNType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +75,8 @@ class SSHKeyManager:
 
     def _extract_public_key(self, private_key_pem: str) -> str:
         """Extract public key from private key"""
-        from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import serialization
 
         try:
             # Load private key
@@ -156,12 +158,12 @@ class PersistenceManager:
 
         # In-memory storage for state (these will be loaded/saved per relay)
         self.document_hashes: Dict[str, Dict[str, str]] = {}  # keyed by relay_id then doc_id
-        self.filemeta_folders: Dict[
-            str, Dict[str, Dict]
-        ] = {}  # keyed by relay_id then folder doc_id
-        self.local_file_state: Dict[
-            str, Dict[str, Dict]
-        ] = {}  # keyed by relay_id then folder_id then path
+        self.filemeta_folders: Dict[str, Dict[str, Dict]] = (
+            {}
+        )  # keyed by relay_id then folder doc_id
+        self.local_file_state: Dict[str, Dict[str, Dict]] = (
+            {}
+        )  # keyed by relay_id then folder_id then path
 
         # In-memory resource index (built from existing data sources)
         self.resource_index: Dict[str, Dict[str, Dict]] = {}  # keyed by relay_id then resource_id
@@ -1281,6 +1283,10 @@ class PersistenceManager:
                         "path": None,
                         "metadata": {},
                     }
+
+    def rebuild_resource_index(self, relay_id: str):
+        """Rebuild the derived in-memory resource index after state changes."""
+        self._build_resource_index(relay_id)
 
     def lookup_resource(self, relay_id: str, resource_id: str) -> Optional[S3RNType]:
         """Look up resource by resource_id and return S3RN object"""
