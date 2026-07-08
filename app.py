@@ -118,8 +118,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--commit-interval",
         type=int,
-        default=10,
-        help="Git commit interval in seconds (default: 10)",
+        default=int(os.getenv("COMMIT_INTERVAL", "10")),
+        help="Git commit interval in seconds (default: from COMMIT_INTERVAL env var, else 10)",
     )
     parser.add_argument(
         "--relay-server-url",
