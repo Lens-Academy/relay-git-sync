@@ -10,21 +10,9 @@ from webhook_handler import WebhookProcessor
 from operations_queue import OperationsQueue
 from web_server import create_server
 
-# --- HTTP timeout guard (incident 2026-07-17) ---------------------------------
-# y-sweet-sdk calls requests.request() without a timeout, so a silently dropped
-# connection (e.g. Cloudflare idling out) blocks the single operations-queue
-# worker forever and all syncing stops. Until the SDK passes timeouts itself,
-# inject a default timeout into every bare requests.request() call.
-import requests as _requests
+from http_timeout import install_default_timeout
 
-_original_request = _requests.request
-
-def _request_with_default_timeout(method, url, **kwargs):
-    kwargs.setdefault("timeout", (10, 120))
-    return _original_request(method, url, **kwargs)
-
-_requests.request = _request_with_default_timeout
-# ------------------------------------------------------------------------------
+install_default_timeout()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
