@@ -9,11 +9,14 @@ import base64
 import jwt
 import datetime
 from typing import Optional
+from http_timeout import install_default_timeout
 from relay_client import RelayClient
 from persistence import PersistenceManager, SSHKeyManager
 from sync_engine import SyncEngine
 from s3rn import S3RemoteFolder
 from git_config import GitConnectorConfig, GitConnector
+
+install_default_timeout()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

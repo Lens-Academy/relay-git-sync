@@ -10,6 +10,10 @@ from webhook_handler import WebhookProcessor
 from operations_queue import OperationsQueue
 from web_server import create_server
 
+from http_timeout import install_default_timeout
+
+install_default_timeout()
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
