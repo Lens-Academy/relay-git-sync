@@ -144,11 +144,9 @@ class SyncEngine:
                         doc_hash = hashlib.sha256(content_str.encode("utf-8")).hexdigest()
                         print(f"Resource {resource_id} hash: {doc_hash}")
 
-                        # Store hash using resource_id
                         old_hash = self.persistence_manager.document_hashes[relay_id].get(
                             resource_id
                         )
-                        self.persistence_manager.document_hashes[relay_id][resource_id] = doc_hash
 
                         # If this is a document update, trigger sync
                         if old_hash != doc_hash:
@@ -156,6 +154,15 @@ class SyncEngine:
                                 document_resource, content_str, doc_hash
                             )
                             operations = [operation] if operation else []
+                            # Record the hash only after the export succeeded.
+                            # Recording it on failure would make every retry
+                            # webhook compare equal hashes and skip the write,
+                            # leaving the exported file stale until the
+                            # document changes again.
+                            if operation is not None and operation.completed and not operation.error:
+                                self.persistence_manager.document_hashes[relay_id][
+                                    resource_id
+                                ] = doc_hash
                         else:
                             operations = []
                     else:
@@ -230,15 +237,17 @@ class SyncEngine:
                 doc_hash = hashlib.sha256(content_str.encode("utf-8")).hexdigest()
                 print(f"Document {resource} hash: {doc_hash}")
 
-                # Store hash using document UUID
                 old_hash = self.persistence_manager.document_hashes[relay_id].get(doc_uuid)
-                self.persistence_manager.document_hashes[relay_id][doc_uuid] = doc_hash
 
                 # If this is a document update, trigger sync
                 if old_hash != doc_hash:
                     operation = self.handle_document_update(resource, content_str, doc_hash)
                     if operation:
                         operations.append(operation)
+                    # Only record the hash once the export succeeded (see
+                    # process_document_change).
+                    if operation is not None and operation.completed and not operation.error:
+                        self.persistence_manager.document_hashes[relay_id][doc_uuid] = doc_hash
 
             # Handle canvas document
             elif parsed_content.get("type") == "canvas":
@@ -250,15 +259,17 @@ class SyncEngine:
                 doc_hash = hashlib.sha256(content_str.encode("utf-8")).hexdigest()
                 print(f"Canvas {resource} hash: {doc_hash}")
 
-                # Store hash using canvas UUID
                 old_hash = self.persistence_manager.document_hashes[relay_id].get(canvas_uuid)
-                self.persistence_manager.document_hashes[relay_id][canvas_uuid] = doc_hash
 
                 # If this is a canvas update, trigger sync
                 if old_hash != doc_hash:
                     operation = self.handle_document_update(resource, content_str, doc_hash)
                     if operation:
                         operations.append(operation)
+                    # Only record the hash once the export succeeded (see
+                    # process_document_change).
+                    if operation is not None and operation.completed and not operation.error:
+                        self.persistence_manager.document_hashes[relay_id][canvas_uuid] = doc_hash
             else:
                 print(f"Document {resource} has no recognized content type")
 
