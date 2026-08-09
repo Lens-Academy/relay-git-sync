@@ -84,6 +84,7 @@ class TestPushRetry:
         self.work_path = os.path.join(self.temp_dir, "work")
         self.repo = git.Repo.init(self.work_path, initial_branch="main")
         self.repo.create_remote("origin", self.remote_path)
+        self._set_git_identity(self.repo)
 
         self._commit_file("seed.md", "seed")
         self.repo.remotes.origin.push("main", set_upstream=True)
@@ -92,6 +93,14 @@ class TestPushRetry:
 
     def teardown_method(self):
         shutil.rmtree(self.temp_dir)
+
+    @staticmethod
+    def _set_git_identity(repo):
+        # `git pull --rebase` (subprocess) needs a committer identity, which
+        # the temp-dir test repos lack; the production container has one.
+        with repo.config_writer() as cw:
+            cw.set_value("user", "name", "Test Sync")
+            cw.set_value("user", "email", "test@example.com")
 
     def _commit_file(self, name, content):
         path = os.path.join(self.work_path, name)
@@ -137,6 +146,53 @@ class TestPushRetry:
         assert committed
         assert not self.repo.is_dirty()
         assert self._remote_head() == self.repo.head.commit.hexsha
+
+    def test_diverged_remote_recovers_via_pull_then_push(self):
+        """GitPython's push() reports a non-fast-forward rejection via flags
+        instead of raising; the rejection must still trigger the
+        pull-then-retry path so a diverged remote converges."""
+        # Someone else pushes to the remote...
+        other_path = os.path.join(self.temp_dir, "other")
+        other = git.Repo.clone_from(self.remote_path, other_path)
+        self._set_git_identity(other)
+        with open(os.path.join(other_path, "other.md"), "w") as f:
+            f.write("remote change")
+        other.git.add(A=True)
+        other.index.commit("remote change")
+        other.remotes.origin.push()
+
+        # ...while we have a local commit the remote lacks.
+        self._commit_file("local.md", "local change")
+        assert not self.repo.is_dirty()
+
+        self.persistence.commit_changes()
+
+        remote_repo = git.Repo(self.remote_path)
+        assert self._remote_head() == self.repo.head.commit.hexsha
+        remote_files = remote_repo.git.ls_tree("--name-only", "main").splitlines()
+        assert "other.md" in remote_files
+        assert "local.md" in remote_files
+
+    def test_failed_push_retry_backs_off(self):
+        """A push retry that does not converge must set a backoff instead of
+        re-pushing on every 5s timer tick."""
+        self.repo.remotes.origin.set_url(os.path.join(self.temp_dir, "gone.git"))
+        self._commit_file("stranded.md", "content")
+
+        push_calls = []
+        original = self.persistence._push_to_remote
+        self.persistence._push_to_remote = lambda *a, **kw: (
+            push_calls.append(a),
+            original(*a, **kw),
+        )
+
+        self.persistence.commit_changes()
+        assert len(push_calls) == 1
+        assert "relay/folder" in self.persistence._push_retry_backoff
+
+        # Immediately after, the backoff window is open: no second attempt.
+        self.persistence.commit_changes()
+        assert len(push_calls) == 1
 
     def test_one_repo_failure_does_not_block_others(self):
         """A broken repo earlier in the iteration must not stop later repos
