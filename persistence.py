@@ -47,10 +47,17 @@ class SSHKeyManager:
         self._setup_ssh_keys()
 
     def _setup_ssh_keys(self):
-        """Set up SSH keys from environment variable"""
+        """Set up SSH keys from environment variable or existing key files"""
+        # Production keeps SSH keys on the mounted data volume.
+        if os.path.exists(self.private_key_path):
+            logger.info(f"SSH key already exists at {self.private_key_path}, skipping env var write")
+            return
+
         ssh_key = os.environ.get(self.ssh_key_env_var)
         if not ssh_key:
-            raise ValueError(f"Environment variable {self.ssh_key_env_var} not found")
+            raise ValueError(
+                f"Environment variable {self.ssh_key_env_var} not found and no existing key at {self.private_key_path}"
+            )
 
         try:
             # Create SSH directory
@@ -370,7 +377,7 @@ class PersistenceManager:
 
         # Set up SSH command to use the key file
         # Let run.sh handle known_hosts with ssh-keyscan
-        ssh_command = f"ssh -o LogLevel=ERROR -o PasswordAuthentication=no -o PreferredAuthentications=publickey -o ConnectTimeout=10 -i {private_key_path}"
+        ssh_command = "ssh -o LogLevel=ERROR -o PasswordAuthentication=no -o PreferredAuthentications=publickey -o ConnectTimeout=10 -F /data/ssh/config"
         os.environ["GIT_SSH_COMMAND"] = ssh_command
 
         logger.info(f"Global SSH setup - Using SSH command: {ssh_command}")
@@ -1003,8 +1010,8 @@ class PersistenceManager:
         # Remove leading slashes
         clean_path = path.lstrip("/")
 
-        # Reject paths containing .. components
-        if ".." in clean_path:
+        # Reject paths containing .. path components, but allow ".." in filenames.
+        if any(part == ".." for part in clean_path.split("/")):
             raise ValueError(f"Path '{path}' contains directory traversal sequences")
 
         # Build the full path
