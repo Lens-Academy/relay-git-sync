@@ -112,16 +112,19 @@ class OperationsQueue:
             self._maybe_commit_changes()
 
     def _maybe_commit_changes(self):
-        """Commit changes to git repositories if there are any"""
-        if not self.sync_state.has_changes:
-            return
+        """Commit changes to git repositories if there are any.
 
+        Deliberately not gated on sync_state.has_changes: commit_changes()
+        already checks each repo's git status, and git is the only source of
+        truth that can't race with the worker thread. Gating on the flag lost
+        edits — the worker could set it while a slow commit+push was in
+        flight, and the timer's reset below then wiped that signal, leaving
+        the edit on disk but uncommitted until the next unrelated change.
+        """
         try:
-            # Use the persistence manager from sync engine to commit changes
             committed = self.sync_engine.persistence_manager.commit_changes()
 
             if committed:
-                # Reset change flag
                 self.sync_state.has_changes = False
                 self.sync_state.last_git_commit = time.time()
 

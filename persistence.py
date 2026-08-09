@@ -712,10 +712,11 @@ class PersistenceManager:
         Returns:
             bool: True if any commits were made, False otherwise
         """
-        try:
-            committed_any = False
-            # Check each folder repository for changes
-            for repo_key, git_repo in self.git_repos.items():
+        committed_any = False
+        # Check each folder repository for changes; one repo's failure must not
+        # block the others, so errors are handled per repo.
+        for repo_key, git_repo in self.git_repos.items():
+            try:
                 if git_repo.is_dirty() or git_repo.untracked_files:
                     # Pull latest changes before committing if remote is configured
                     if git_repo.remotes:
@@ -735,12 +736,38 @@ class PersistenceManager:
 
                     # Push to remote if configured
                     self._push_to_remote(repo_key, git_repo)
+                elif self._has_unpushed_commits(repo_key, git_repo):
+                    # A push that failed earlier (network blip, remote outage)
+                    # leaves the repo clean but ahead of its remote; without
+                    # this retry nothing would push it until the next edit.
+                    logger.warning(
+                        f"Repository {repo_key} is ahead of its remote with no new changes - retrying push"
+                    )
+                    self._push_to_remote(repo_key, git_repo)
 
-            return committed_any
+            except Exception as e:
+                logger.error(f"Error committing repository {repo_key}: {e}")
+                logger.error(f"Git commit traceback: {traceback.format_exc()}")
 
+        return committed_any
+
+    def _has_unpushed_commits(self, repo_key: str, git_repo: git.Repo) -> bool:
+        """Check whether the current branch has commits its remote lacks"""
+        if not git_repo.remotes:
+            return False
+        try:
+            current_branch = git_repo.active_branch
+            tracking_branch = current_branch.tracking_branch()
+            if tracking_branch is None:
+                # Commits exist but no upstream is set: the initial push
+                # (which sets the upstream) hasn't succeeded yet.
+                return git_repo.head.is_valid()
+            ahead = git_repo.git.rev_list(
+                "--count", f"{tracking_branch.name}..{current_branch.name}"
+            )
+            return int(ahead.strip()) > 0
         except Exception as e:
-            logger.error(f"Error committing to git: {e}")
-            logger.error(f"Git commit traceback: {traceback.format_exc()}")
+            logger.debug(f"Could not determine unpushed commits for {repo_key}: {e}")
             return False
 
     def _pull_from_remote(self, repo_key: str, git_repo: git.Repo):
