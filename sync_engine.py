@@ -585,7 +585,18 @@ class SyncEngine:
         """Check if a file should be updated based on hash comparison"""
         remote_hash = metadata.get("hash")
         if not remote_hash:
-            return True  # No hash available, assume update needed
+            # Markdown/canvas filemeta entries never carry a hash (only blob
+            # uploads write one), so "no hash" used to mean "fetch every doc on
+            # every folder sweep" — thousands of sequential HTTP fetches that
+            # blocked the worker queue for minutes. Fall back to the hash of
+            # our own last successful export: if the local file still matches
+            # it, there is nothing to re-export and no fetch is needed.
+            exported_hash = self.persistence_manager.document_hashes.get(relay_id, {}).get(
+                doc_id
+            )
+            if not exported_hash:
+                return True  # Never exported by us - fetch once, hash recorded after write
+            remote_hash = exported_hash
 
         # Get local file hash
         try:
@@ -596,6 +607,20 @@ class SyncEngine:
         except Exception as e:
             logger.warning(f"Error reading file {full_path} for hash comparison: {e}")
             return True  # Error reading file, assume update needed
+
+    def _record_exported_hash(self, document_resource: S3RNType, content: str):
+        """Record the hash of a successfully exported document/canvas.
+
+        Must be called only after write_file_content succeeded: a hash recorded
+        for content that never reached disk would make should_update_file skip
+        the doc forever. The per-document webhook path also records this hash at
+        its own call sites; the duplication is intentional (identical values).
+        """
+        relay_id = S3RN.get_relay_id(document_resource)
+        doc_id = document_resource.get_resource_id()
+        self.persistence_manager.document_hashes.setdefault(relay_id, {})[doc_id] = (
+            hashlib.sha256(content.encode("utf-8")).hexdigest()
+        )
 
     def execute_sync_operation(self, relay_id: str, operation: SyncOperation):
         """Execute a sync operation"""
@@ -684,6 +709,7 @@ class SyncEngine:
             full_path = self.persistence_manager.write_file_content(
                 document_resource, path, content, file_hash
             )
+            self._record_exported_hash(document_resource, content)
         else:
             # Regular document/text content
             content = self.relay_client.fetch_document_content(document_resource)
@@ -699,6 +725,7 @@ class SyncEngine:
             full_path = self.persistence_manager.write_file_content(
                 document_resource, path, content, file_hash
             )
+            self._record_exported_hash(document_resource, content)
 
         print(f"Created {full_path}")
 
@@ -756,6 +783,7 @@ class SyncEngine:
                 full_path = self.persistence_manager.write_file_content(
                     document_resource, path, content, file_hash
                 )
+                self._record_exported_hash(document_resource, content)
 
                 print(f"Updated {full_path}")
             else:
@@ -773,6 +801,7 @@ class SyncEngine:
                 full_path = self.persistence_manager.write_file_content(
                     document_resource, path, content, file_hash
                 )
+                self._record_exported_hash(document_resource, content)
 
                 print(f"Updated {full_path}")
             else:
