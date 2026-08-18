@@ -120,12 +120,18 @@ class SyncEngine:
                     )
                     operations = []
                 else:
-                    # Fetch content based on resource type
+                    # Fetch content based on resource type. raise_on_error so a
+                    # transient fetch failure surfaces as success=False (and gets
+                    # retried by the queue) instead of silently dropping the change.
                     if isinstance(document_resource, S3RemoteDocument):
-                        content_str = self.relay_client.fetch_document_content(document_resource)
+                        content_str = self.relay_client.fetch_document_content(
+                            document_resource, raise_on_error=True
+                        )
                         doc_type = "document"
                     elif isinstance(document_resource, S3RemoteCanvas):
-                        content_str = self.relay_client.fetch_canvas_content(document_resource)
+                        content_str = self.relay_client.fetch_canvas_content(
+                            document_resource, raise_on_error=True
+                        )
                         doc_type = "canvas"
                     elif isinstance(document_resource, S3RemoteFile):
                         # Files don't have text content to hash, they're handled differently
@@ -221,7 +227,7 @@ class SyncEngine:
 
                 # Apply sync algorithm for folder changes
                 folder_operations = self.apply_remote_folder_changes(
-                    relay_id, resource, old_filemeta, filemeta_dict
+                    relay_id, resource, old_filemeta, filemeta_dict, force=request.force
                 )
                 operations.extend(folder_operations)
 
@@ -389,7 +395,12 @@ class SyncEngine:
             return None
 
     def apply_remote_folder_changes(
-        self, relay_id: str, folder_resource: S3RemoteFolder, old_filemeta: Dict, new_filemeta: Dict
+        self,
+        relay_id: str,
+        folder_resource: S3RemoteFolder,
+        old_filemeta: Dict,
+        new_filemeta: Dict,
+        force: bool = False,
     ) -> List[SyncOperation]:
         """
         Algorithm for applying remote folder changes to the local vault.
@@ -413,7 +424,13 @@ class SyncEngine:
                 # Phase 1: Process folder operations first (renames/moves affect files)
                 print(f"Phase 1: Processing folder operations for {folder_uuid}")
                 self.sync_by_type(
-                    relay_id, folder_resource, new_filemeta, diff_log, operations, [SyncType.FOLDER]
+                    relay_id,
+                    folder_resource,
+                    new_filemeta,
+                    diff_log,
+                    operations,
+                    [SyncType.FOLDER],
+                    force,
                 )
 
                 # Wait for folder operations to complete
@@ -431,7 +448,7 @@ class SyncEngine:
                     SyncType.FILE,
                 ]
                 self.sync_by_type(
-                    relay_id, folder_resource, new_filemeta, diff_log, operations, file_sync_types
+                    relay_id, folder_resource, new_filemeta, diff_log, operations, file_sync_types, force
                 )
 
                 # Phase 3: Handle deletions after creates/renames complete
@@ -475,6 +492,7 @@ class SyncEngine:
         diff_log: List[str],
         operations: List[SyncOperation],
         sync_types: List[SyncType],
+        force: bool = False,
     ):
         """Process remote changes for specific file types."""
         for path, metadata in filemeta.items():
@@ -482,7 +500,7 @@ class SyncEngine:
                 file_type = self.get_file_type(path, metadata)
                 if file_type in sync_types:
                     operation = self.apply_remote_state(
-                        relay_id, folder_resource, path, metadata, diff_log
+                        relay_id, folder_resource, path, metadata, diff_log, force
                     )
                     if operation:
                         operations.append(operation)
@@ -494,6 +512,7 @@ class SyncEngine:
         path: str,
         metadata: Dict,
         diff_log: List[str],
+        force: bool = False,
     ) -> Optional[SyncOperation]:
         """
         Core algorithm for determining what operation to perform for a remote file change.
@@ -524,7 +543,7 @@ class SyncEngine:
         # Case 1: File exists locally
         if os.path.exists(full_path):
             # Check if file needs updating (hash comparison)
-            if self.should_update_file(relay_id, doc_id, metadata, full_path):
+            if self.should_update_file(relay_id, doc_id, metadata, full_path, force):
                 diff_log.append(f"updating {folder_uuid}/{path.lstrip('/')}")
                 # Create S3RN resources for the operation
                 document_resource = create_document_resource_from_metadata(
@@ -580,12 +599,29 @@ class SyncEngine:
         )
 
     def should_update_file(
-        self, relay_id: str, doc_id: str, metadata: Dict, full_path: str
+        self, relay_id: str, doc_id: str, metadata: Dict, full_path: str, force: bool = False
     ) -> bool:
         """Check if a file should be updated based on hash comparison"""
         remote_hash = metadata.get("hash")
         if not remote_hash:
-            return True  # No hash available, assume update needed
+            # Markdown/canvas filemeta entries never carry a hash (only blob
+            # uploads write one), so "no hash" used to mean "fetch every doc on
+            # every folder sweep" — thousands of sequential HTTP fetches that
+            # blocked the worker queue for minutes. Fall back to the hash of
+            # our own last successful export: if the local file still matches
+            # it, there is nothing to re-export and no fetch is needed.
+            if force:
+                # Reconcile sweep: our own export hash can be stale (lost
+                # webhook, exhausted retry budget, restart during backoff), so
+                # re-fetch regardless of it. Filemeta hashes above stay
+                # authoritative — the sweep fetched them fresh.
+                return True
+            exported_hash = self.persistence_manager.document_hashes.get(relay_id, {}).get(
+                doc_id
+            )
+            if not exported_hash:
+                return True  # Never exported by us - fetch once, hash recorded after write
+            remote_hash = exported_hash
 
         # Get local file hash
         try:
@@ -596,6 +632,20 @@ class SyncEngine:
         except Exception as e:
             logger.warning(f"Error reading file {full_path} for hash comparison: {e}")
             return True  # Error reading file, assume update needed
+
+    def _record_exported_hash(self, document_resource: S3RNType, content: str):
+        """Record the hash of a successfully exported document/canvas.
+
+        Must be called only after write_file_content succeeded: a hash recorded
+        for content that never reached disk would make should_update_file skip
+        the doc forever. The per-document webhook path also records this hash at
+        its own call sites; the duplication is intentional (identical values).
+        """
+        relay_id = S3RN.get_relay_id(document_resource)
+        doc_id = document_resource.get_resource_id()
+        self.persistence_manager.document_hashes.setdefault(relay_id, {})[doc_id] = (
+            hashlib.sha256(content.encode("utf-8")).hexdigest()
+        )
 
     def execute_sync_operation(self, relay_id: str, operation: SyncOperation):
         """Execute a sync operation"""
@@ -684,6 +734,7 @@ class SyncEngine:
             full_path = self.persistence_manager.write_file_content(
                 document_resource, path, content, file_hash
             )
+            self._record_exported_hash(document_resource, content)
         else:
             # Regular document/text content
             content = self.relay_client.fetch_document_content(document_resource)
@@ -699,6 +750,7 @@ class SyncEngine:
             full_path = self.persistence_manager.write_file_content(
                 document_resource, path, content, file_hash
             )
+            self._record_exported_hash(document_resource, content)
 
         print(f"Created {full_path}")
 
@@ -756,6 +808,7 @@ class SyncEngine:
                 full_path = self.persistence_manager.write_file_content(
                     document_resource, path, content, file_hash
                 )
+                self._record_exported_hash(document_resource, content)
 
                 print(f"Updated {full_path}")
             else:
@@ -773,6 +826,7 @@ class SyncEngine:
                 full_path = self.persistence_manager.write_file_content(
                     document_resource, path, content, file_hash
                 )
+                self._record_exported_hash(document_resource, content)
 
                 print(f"Updated {full_path}")
             else:

@@ -86,10 +86,15 @@ def run_server(
     commit_interval=10,
     data_dir=".",
     git_config_file=None,
+    reconcile_interval=86400,
 ):
     print(f"Relay server: {relay_server_url}")
     print(f"Data directory: {data_dir}")
     print(f"Git commit interval set to {commit_interval} seconds")
+    if reconcile_interval > 0:
+        print(f"Reconcile sweep interval set to {reconcile_interval} seconds")
+    else:
+        print("Reconcile sweep disabled")
 
     try:
         # Initialize components
@@ -97,7 +102,7 @@ def run_server(
         persistence_manager = PersistenceManager(data_dir, git_config_file)
         sync_engine = SyncEngine(data_dir, relay_client, persistence_manager)
         webhook_processor = WebhookProcessor(relay_client)
-        operations_queue = OperationsQueue(sync_engine, commit_interval)
+        operations_queue = OperationsQueue(sync_engine, commit_interval, reconcile_interval)
         web_server = create_server(
             webhook_processor, operations_queue, webhook_secret, persistence_manager
         )
@@ -124,6 +129,13 @@ if __name__ == "__main__":
         type=int,
         default=int(os.getenv("COMMIT_INTERVAL", "10")),
         help="Git commit interval in seconds (default: from COMMIT_INTERVAL env var, else 10)",
+    )
+    parser.add_argument(
+        "--reconcile-interval",
+        type=int,
+        default=int(os.getenv("RECONCILE_INTERVAL", "86400")),
+        help="Forced full-sweep interval in seconds, 0 to disable "
+        "(default: from RECONCILE_INTERVAL env var, else 86400)",
     )
     parser.add_argument(
         "--relay-server-url",
@@ -176,4 +188,5 @@ if __name__ == "__main__":
         args.commit_interval,
         args.data_dir,
         args.git_config_file,
+        args.reconcile_interval,
     )

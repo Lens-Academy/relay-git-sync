@@ -14,6 +14,10 @@ from models import ResourceType, get_s3rn_resource_category
 logger = logging.getLogger(__name__)
 
 
+class RelayFetchError(Exception):
+    """Transient failure fetching a doc from the relay (network error, 5xx, timeout)."""
+
+
 class RelayClient:
     """Wrapper around Y-Sweet DocumentManager with authentication handling"""
 
@@ -52,8 +56,15 @@ class RelayClient:
         """Get document update from Y-Sweet server"""
         return self.dm.get_doc_as_update(doc_id)
 
-    def fetch_document_content(self, resource: S3RNType) -> Optional[str]:
-        """Fetch document content from remote using S3RN resource"""
+    def fetch_document_content(
+        self, resource: S3RNType, raise_on_error: bool = False
+    ) -> Optional[str]:
+        """Fetch document content from remote using S3RN resource.
+
+        With raise_on_error=True, fetch failures raise RelayFetchError and a
+        None return unambiguously means the doc exists but has no contents key.
+        With the default, both cases return None (legacy sweep semantics).
+        """
         try:
             # Construct compound ID for Y-Sweet at the boundary
             compound_doc_id = S3RN.get_compound_document_id(resource)
@@ -76,10 +87,17 @@ class RelayClient:
         except Exception as e:
             logger.error(f"Error fetching document {resource}: {e}")
             logger.error(f"Document fetch traceback: {traceback.format_exc()}")
+            if raise_on_error:
+                raise RelayFetchError(f"fetch failed for {resource}: {e}") from e
             return None
 
-    def fetch_canvas_content(self, resource: S3RemoteCanvas) -> Optional[str]:
-        """Fetch canvas content from remote and export as JSON string"""
+    def fetch_canvas_content(
+        self, resource: S3RemoteCanvas, raise_on_error: bool = False
+    ) -> Optional[str]:
+        """Fetch canvas content from remote and export as JSON string.
+
+        See fetch_document_content for raise_on_error semantics.
+        """
         try:
             # Construct compound ID for Y-Sweet at the boundary
             compound_doc_id = S3RN.get_compound_document_id(resource)
@@ -102,6 +120,8 @@ class RelayClient:
         except Exception as e:
             logger.error(f"Error fetching canvas {resource}: {e}")
             logger.error(f"Canvas fetch traceback: {traceback.format_exc()}")
+            if raise_on_error:
+                raise RelayFetchError(f"fetch failed for {resource}: {e}") from e
             return None
 
     def _export_canvas_data(self, doc: Doc) -> Dict[str, Any]:
