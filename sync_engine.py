@@ -227,7 +227,7 @@ class SyncEngine:
 
                 # Apply sync algorithm for folder changes
                 folder_operations = self.apply_remote_folder_changes(
-                    relay_id, resource, old_filemeta, filemeta_dict
+                    relay_id, resource, old_filemeta, filemeta_dict, force=request.force
                 )
                 operations.extend(folder_operations)
 
@@ -395,7 +395,12 @@ class SyncEngine:
             return None
 
     def apply_remote_folder_changes(
-        self, relay_id: str, folder_resource: S3RemoteFolder, old_filemeta: Dict, new_filemeta: Dict
+        self,
+        relay_id: str,
+        folder_resource: S3RemoteFolder,
+        old_filemeta: Dict,
+        new_filemeta: Dict,
+        force: bool = False,
     ) -> List[SyncOperation]:
         """
         Algorithm for applying remote folder changes to the local vault.
@@ -419,7 +424,13 @@ class SyncEngine:
                 # Phase 1: Process folder operations first (renames/moves affect files)
                 print(f"Phase 1: Processing folder operations for {folder_uuid}")
                 self.sync_by_type(
-                    relay_id, folder_resource, new_filemeta, diff_log, operations, [SyncType.FOLDER]
+                    relay_id,
+                    folder_resource,
+                    new_filemeta,
+                    diff_log,
+                    operations,
+                    [SyncType.FOLDER],
+                    force,
                 )
 
                 # Wait for folder operations to complete
@@ -437,7 +448,7 @@ class SyncEngine:
                     SyncType.FILE,
                 ]
                 self.sync_by_type(
-                    relay_id, folder_resource, new_filemeta, diff_log, operations, file_sync_types
+                    relay_id, folder_resource, new_filemeta, diff_log, operations, file_sync_types, force
                 )
 
                 # Phase 3: Handle deletions after creates/renames complete
@@ -481,6 +492,7 @@ class SyncEngine:
         diff_log: List[str],
         operations: List[SyncOperation],
         sync_types: List[SyncType],
+        force: bool = False,
     ):
         """Process remote changes for specific file types."""
         for path, metadata in filemeta.items():
@@ -488,7 +500,7 @@ class SyncEngine:
                 file_type = self.get_file_type(path, metadata)
                 if file_type in sync_types:
                     operation = self.apply_remote_state(
-                        relay_id, folder_resource, path, metadata, diff_log
+                        relay_id, folder_resource, path, metadata, diff_log, force
                     )
                     if operation:
                         operations.append(operation)
@@ -500,6 +512,7 @@ class SyncEngine:
         path: str,
         metadata: Dict,
         diff_log: List[str],
+        force: bool = False,
     ) -> Optional[SyncOperation]:
         """
         Core algorithm for determining what operation to perform for a remote file change.
@@ -530,7 +543,7 @@ class SyncEngine:
         # Case 1: File exists locally
         if os.path.exists(full_path):
             # Check if file needs updating (hash comparison)
-            if self.should_update_file(relay_id, doc_id, metadata, full_path):
+            if self.should_update_file(relay_id, doc_id, metadata, full_path, force):
                 diff_log.append(f"updating {folder_uuid}/{path.lstrip('/')}")
                 # Create S3RN resources for the operation
                 document_resource = create_document_resource_from_metadata(
@@ -586,7 +599,7 @@ class SyncEngine:
         )
 
     def should_update_file(
-        self, relay_id: str, doc_id: str, metadata: Dict, full_path: str
+        self, relay_id: str, doc_id: str, metadata: Dict, full_path: str, force: bool = False
     ) -> bool:
         """Check if a file should be updated based on hash comparison"""
         remote_hash = metadata.get("hash")
@@ -597,6 +610,12 @@ class SyncEngine:
             # blocked the worker queue for minutes. Fall back to the hash of
             # our own last successful export: if the local file still matches
             # it, there is nothing to re-export and no fetch is needed.
+            if force:
+                # Reconcile sweep: our own export hash can be stale (lost
+                # webhook, exhausted retry budget, restart during backoff), so
+                # re-fetch regardless of it. Filemeta hashes above stay
+                # authoritative — the sweep fetched them fresh.
+                return True
             exported_hash = self.persistence_manager.document_hashes.get(relay_id, {}).get(
                 doc_id
             )

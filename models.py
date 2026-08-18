@@ -142,6 +142,9 @@ class FileMetadata:
 class SyncRequest:
     resource: S3RNType  # Can be folder, document, etc.
     timestamp: datetime
+    # Reconcile sweeps set this to bypass the export-hash NOOP fast path in
+    # should_update_file, re-fetching docs whose webhook or retry was lost.
+    force: bool = False
 
 
 @dataclass

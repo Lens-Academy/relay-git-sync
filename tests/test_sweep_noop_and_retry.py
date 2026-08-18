@@ -15,6 +15,13 @@
    and the per-doc path reported success - a relay hiccup stranded that doc's
    change until the doc was edited again. Fix: the per-doc path raises
    RelayFetchError on fetch failure, and the queue retries with capped backoff.
+
+3. Fix (1) removed the sweep's role as catch-all repair: a change lost to a
+   dropped webhook, an exhausted retry budget, or a restart that wiped the
+   in-memory retry table left the local file matching our own last export, so
+   every later sweep NOOPed and the doc stayed stale forever. Fix: a periodic
+   reconcile timer enqueues forced sweeps (SyncRequest.force) that bypass the
+   export-hash fallback and re-fetch every hashless doc.
 """
 
 import hashlib
@@ -197,6 +204,72 @@ class TestSweepRecordsExportHash(EngineHarness):
             self.pm.document_hashes[RELAY_ID][DOC_ID]
             == hashlib.sha256(canvas_json.encode("utf-8")).hexdigest()
         )
+
+
+class TestForcedReconcileSweep(EngineHarness):
+    def sweep_forced(self):
+        return self.engine.apply_remote_folder_changes(
+            RELAY_ID, self.folder, {}, self.filemeta, force=True
+        )
+
+    def test_force_bypasses_export_hash_fallback(self):
+        """Local file matches our own last export (ordinary sweep NOOPs), but
+        the remote changed under a lost webhook - a forced sweep re-fetches
+        and repairs the stale export."""
+        stale = "content from before the lost webhook\n"
+        self.write_local(stale)
+        self.pm.document_hashes[RELAY_ID][DOC_ID] = hashlib.sha256(
+            stale.encode("utf-8")
+        ).hexdigest()
+
+        operations = self.sweep()
+        doc_ops = [op for op in operations if op.path == DOC_PATH]
+        assert doc_ops and doc_ops[0].type == OperationType.NOOP
+        self.relay_client.fetch_document_content.assert_not_called()
+
+        operations = self.sweep_forced()
+        doc_ops = [op for op in operations if op.path == DOC_PATH]
+        assert doc_ops and doc_ops[0].type == OperationType.UPDATE
+        with open(self.exported_file(), encoding="utf-8") as f:
+            assert f.read() == CONTENT
+        assert self.pm.document_hashes[RELAY_ID][DOC_ID] == CONTENT_HASH
+
+    def test_force_respects_authoritative_filemeta_hash(self):
+        """Blob entries carry a server-side hash the sweep fetched fresh; force
+        must not override that comparison."""
+        self.write_local()
+        meta = {"id": DOC_ID, "type": "file", "hash": CONTENT_HASH}
+        assert (
+            self.engine.should_update_file(
+                RELAY_ID, DOC_ID, meta, self.exported_file(), force=True
+            )
+            is False
+        )
+
+    def test_reconcile_requests_built_from_git_connectors(self):
+        from git_config import GitConnector
+
+        self.pm.git_config.connectors = [
+            GitConnector(
+                shared_folder_id=FOLDER_ID,
+                relay_id=RELAY_ID,
+                url="git@example.com:lens/repo.git",
+            )
+        ]
+        queue = OperationsQueue(self.engine, commit_interval=3600, reconcile_interval=0)
+
+        requests = queue._build_reconcile_requests()
+
+        assert len(requests) == 1
+        assert requests[0].force is True
+        resource = requests[0].resource
+        assert isinstance(resource, S3RemoteFolder)
+        assert resource.relay_id == RELAY_ID
+        assert resource.folder_id == FOLDER_ID
+
+    def test_reconcile_interval_zero_starts_no_timer(self):
+        queue = OperationsQueue(self.engine, commit_interval=3600, reconcile_interval=0)
+        assert not hasattr(queue, "reconcile_timer_thread")
 
 
 def make_change(attempt=None):

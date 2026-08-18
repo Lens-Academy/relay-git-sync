@@ -4,8 +4,10 @@ import queue
 import threading
 import time
 import logging
-from typing import Dict, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 from models import SyncRequest, SyncResult, SyncState
+from s3rn import S3RemoteFolder
 from sync_engine import SyncEngine
 
 logger = logging.getLogger(__name__)
@@ -19,9 +21,15 @@ class OperationsQueue:
     # retry forever.
     RETRY_DELAYS = [10, 30, 60, 120, 300]
 
-    def __init__(self, sync_engine: SyncEngine, commit_interval: int = 10):
+    def __init__(
+        self,
+        sync_engine: SyncEngine,
+        commit_interval: int = 10,
+        reconcile_interval: int = 86400,
+    ):
         self.sync_engine = sync_engine
         self.commit_interval = commit_interval
+        self.reconcile_interval = reconcile_interval
         self.request_queue = queue.Queue()
         self.sync_state = SyncState()
 
@@ -40,6 +48,12 @@ class OperationsQueue:
 
         self.retry_timer_thread = threading.Thread(target=self._retry_timer_loop, daemon=True)
         self.retry_timer_thread.start()
+
+        if self.reconcile_interval > 0:
+            self.reconcile_timer_thread = threading.Thread(
+                target=self._reconcile_timer_loop, daemon=True
+            )
+            self.reconcile_timer_thread.start()
 
     def enqueue_sync_request(self, request: SyncRequest):
         """Add a sync request to the processing queue"""
@@ -199,6 +213,42 @@ class OperationsQueue:
                 self._flush_due_retries()
             except Exception as e:
                 logger.error(f"Error in retry timer: {e}")
+
+    def _reconcile_timer_loop(self):
+        """Periodically enqueue forced full sweeps of every connected folder.
+
+        This is the safety net for the export-hash NOOP fast path: a change
+        whose webhook was dropped, whose retry budget ran out, or whose pending
+        retry died with a restart leaves the local file matching our own last
+        export, so ordinary sweeps skip it forever. A forced sweep re-fetches
+        those docs and repairs the miss. Sleeps first — startup sync already
+        swept every folder.
+        """
+        while True:
+            time.sleep(self.reconcile_interval)
+            try:
+                self.enqueue_reconcile_sweeps()
+            except Exception as e:
+                logger.error(f"Error in reconcile timer: {e}")
+
+    def enqueue_reconcile_sweeps(self):
+        """Enqueue a forced sweep for every configured git connector folder."""
+        for request in self._build_reconcile_requests():
+            self.enqueue_sync_request(request)
+
+    def _build_reconcile_requests(self) -> List[SyncRequest]:
+        connectors = self.sync_engine.persistence_manager.git_config.connectors
+        requests = [
+            SyncRequest(
+                resource=S3RemoteFolder(connector.relay_id, connector.shared_folder_id),
+                timestamp=datetime.now(timezone.utc),
+                force=True,
+            )
+            for connector in connectors
+        ]
+        if requests:
+            logger.info(f"Reconcile sweep: enqueuing {len(requests)} forced folder sweeps")
+        return requests
 
     def get_pending_retry_count(self) -> int:
         """Number of failed document changes currently awaiting retry."""
