@@ -120,12 +120,18 @@ class SyncEngine:
                     )
                     operations = []
                 else:
-                    # Fetch content based on resource type
+                    # Fetch content based on resource type. raise_on_error so a
+                    # transient fetch failure surfaces as success=False (and gets
+                    # retried by the queue) instead of silently dropping the change.
                     if isinstance(document_resource, S3RemoteDocument):
-                        content_str = self.relay_client.fetch_document_content(document_resource)
+                        content_str = self.relay_client.fetch_document_content(
+                            document_resource, raise_on_error=True
+                        )
                         doc_type = "document"
                     elif isinstance(document_resource, S3RemoteCanvas):
-                        content_str = self.relay_client.fetch_canvas_content(document_resource)
+                        content_str = self.relay_client.fetch_canvas_content(
+                            document_resource, raise_on_error=True
+                        )
                         doc_type = "canvas"
                     elif isinstance(document_resource, S3RemoteFile):
                         # Files don't have text content to hash, they're handled differently
