@@ -47,10 +47,17 @@ class SSHKeyManager:
         self._setup_ssh_keys()
 
     def _setup_ssh_keys(self):
-        """Set up SSH keys from environment variable"""
+        """Set up SSH keys from environment variable or existing key files"""
+        # Production keeps SSH keys on the mounted data volume.
+        if os.path.exists(self.private_key_path):
+            logger.info(f"SSH key already exists at {self.private_key_path}, skipping env var write")
+            return
+
         ssh_key = os.environ.get(self.ssh_key_env_var)
         if not ssh_key:
-            raise ValueError(f"Environment variable {self.ssh_key_env_var} not found")
+            raise ValueError(
+                f"Environment variable {self.ssh_key_env_var} not found and no existing key at {self.private_key_path}"
+            )
 
         try:
             # Create SSH directory
@@ -133,6 +140,9 @@ class PersistenceManager:
         self.data_dir = data_dir
         self.git_repos: Dict[str, git.Repo] = {}  # Now keyed by "relay_id/folder_id"
         self.git_lock = threading.Lock()  # Prevent concurrent git operations
+        # Backoff for retrying pushes of clean-but-ahead repos, keyed by
+        # repo_key: (consecutive_failures, earliest_next_retry_timestamp)
+        self._push_retry_backoff: Dict[str, tuple] = {}
 
         # Initialize git connector configuration first to get known hosts
         config_path = git_config_file or os.path.join(self.data_dir, "git_connectors.toml")
@@ -370,7 +380,7 @@ class PersistenceManager:
 
         # Set up SSH command to use the key file
         # Let run.sh handle known_hosts with ssh-keyscan
-        ssh_command = f"ssh -o LogLevel=ERROR -o PasswordAuthentication=no -o PreferredAuthentications=publickey -o ConnectTimeout=10 -i {private_key_path}"
+        ssh_command = "ssh -o LogLevel=ERROR -o PasswordAuthentication=no -o PreferredAuthentications=publickey -o ConnectTimeout=10 -F /data/ssh/config"
         os.environ["GIT_SSH_COMMAND"] = ssh_command
 
         logger.info(f"Global SSH setup - Using SSH command: {ssh_command}")
@@ -705,10 +715,12 @@ class PersistenceManager:
         Returns:
             bool: True if any commits were made, False otherwise
         """
-        try:
-            committed_any = False
-            # Check each folder repository for changes
-            for repo_key, git_repo in self.git_repos.items():
+        committed_any = False
+        # Check each folder repository for changes; one repo's failure must not
+        # block the others, so errors are handled per repo. Iterate over a
+        # snapshot because the worker thread can register new repos meanwhile.
+        for repo_key, git_repo in list(self.git_repos.items()):
+            try:
                 if git_repo.is_dirty() or git_repo.untracked_files:
                     # Pull latest changes before committing if remote is configured
                     if git_repo.remotes:
@@ -728,12 +740,57 @@ class PersistenceManager:
 
                     # Push to remote if configured
                     self._push_to_remote(repo_key, git_repo)
+                    self._update_push_backoff(repo_key, git_repo)
+                elif self._has_unpushed_commits(repo_key, git_repo):
+                    # A push that failed earlier (network blip, remote outage)
+                    # leaves the repo clean but ahead of its remote; without
+                    # this retry nothing would push it until the next edit.
+                    _, next_retry_at = self._push_retry_backoff.get(repo_key, (0, 0.0))
+                    if time.time() < next_retry_at:
+                        continue
+                    logger.warning(
+                        f"Repository {repo_key} is ahead of its remote with no new changes - retrying push"
+                    )
+                    self._push_to_remote(repo_key, git_repo)
+                    self._update_push_backoff(repo_key, git_repo)
 
-            return committed_any
+            except Exception as e:
+                logger.error(f"Error committing repository {repo_key}: {e}")
+                logger.error(f"Git commit traceback: {traceback.format_exc()}")
 
+        return committed_any
+
+    def _update_push_backoff(self, repo_key: str, git_repo: git.Repo):
+        """Track push convergence so failed retries back off instead of
+        hammering the remote every commit-timer tick (5s in production)."""
+        if self._has_unpushed_commits(repo_key, git_repo):
+            failures, _ = self._push_retry_backoff.get(repo_key, (0, 0.0))
+            failures += 1
+            delay = min(300.0, 5.0 * (2**failures))
+            self._push_retry_backoff[repo_key] = (failures, time.time() + delay)
+            logger.warning(
+                f"Push for {repo_key} did not reach the remote; next retry in {delay:.0f}s"
+            )
+        else:
+            self._push_retry_backoff.pop(repo_key, None)
+
+    def _has_unpushed_commits(self, repo_key: str, git_repo: git.Repo) -> bool:
+        """Check whether the current branch has commits its remote lacks"""
+        if not git_repo.remotes:
+            return False
+        try:
+            current_branch = git_repo.active_branch
+            tracking_branch = current_branch.tracking_branch()
+            if tracking_branch is None:
+                # Commits exist but no upstream is set: the initial push
+                # (which sets the upstream) hasn't succeeded yet.
+                return git_repo.head.is_valid()
+            ahead = git_repo.git.rev_list(
+                "--count", f"{tracking_branch.name}..{current_branch.name}"
+            )
+            return int(ahead.strip()) > 0
         except Exception as e:
-            logger.error(f"Error committing to git: {e}")
-            logger.error(f"Git commit traceback: {traceback.format_exc()}")
+            logger.debug(f"Could not determine unpushed commits for {repo_key}: {e}")
             return False
 
     def _pull_from_remote(self, repo_key: str, git_repo: git.Repo):
@@ -761,6 +818,11 @@ class PersistenceManager:
                     print(f"Fetching from {origin.name} for repository {repo_key}")
                     self._safe_git_fetch_with_debug(origin, repo_key)
                     return
+
+                # Refresh remote refs first: behind/ahead below is computed
+                # against the tracking ref, which is stale until fetched -
+                # without this the pull silently no-ops on a diverged remote.
+                self._safe_git_fetch_with_debug(origin, repo_key)
 
                 # Check if local branch is ahead of remote
                 ahead_behind = git_repo.git.rev_list(
@@ -907,6 +969,28 @@ class PersistenceManager:
             logger.error(f"Error during conflict resolution for {repo_key}: {e}")
             logger.error(f"Conflict resolution traceback: {traceback.format_exc()}")
 
+    @staticmethod
+    def _raise_on_push_error(push_infos):
+        """Convert per-ref push failures into the exception callers handle.
+
+        GitPython's Remote.push() does not raise when the remote rejects a
+        ref (e.g. non-fast-forward); it returns normally with the ERROR flag
+        set on the PushInfo. Without this check a rejection is silently
+        ignored and the pull-then-retry recovery path never runs.
+        """
+        if push_infos is None:
+            return
+        try:
+            failed = [info for info in push_infos if info.flags & git.PushInfo.ERROR]
+        except TypeError:
+            # Not a PushInfo collection (e.g. mocked in tests) - nothing to check
+            return
+        if failed:
+            summaries = "; ".join(info.summary.strip() for info in failed)
+            raise git.exc.GitCommandError(
+                ["git", "push"], 1, stderr=f"push rejected: {summaries}"
+            )
+
     def _push_to_remote(self, repo_key: str, git_repo: git.Repo):
         """Push commits to remote repository if configured"""
         try:
@@ -927,8 +1011,10 @@ class PersistenceManager:
                 current_branch = git_repo.active_branch
                 if current_branch.tracking_branch() is None:
                     # Set upstream for first push
-                    self._safe_git_operation(
-                        lambda: origin.push(current_branch.name, set_upstream=True)
+                    self._raise_on_push_error(
+                        self._safe_git_operation(
+                            lambda: origin.push(current_branch.name, set_upstream=True)
+                        )
                     )
                     print(
                         f"Git push (set upstream) for repository {repo_key} to {origin.name}/{current_branch.name}"
@@ -936,7 +1022,9 @@ class PersistenceManager:
                 else:
                     # Regular push - don't force to avoid clobbering other commits
                     try:
-                        self._safe_git_operation(lambda: origin.push())
+                        self._raise_on_push_error(
+                            self._safe_git_operation(lambda: origin.push())
+                        )
                         print(
                             f"Git push for repository {repo_key} to {origin.name}/{current_branch.name}"
                         )
@@ -951,7 +1039,9 @@ class PersistenceManager:
 
                             # Try pushing again after pull
                             try:
-                                self._safe_git_operation(lambda: origin.push())
+                                self._raise_on_push_error(
+                                    self._safe_git_operation(lambda: origin.push())
+                                )
                                 print(f"Git push successful after pull for repository {repo_key}")
                             except git.exc.GitCommandError:
                                 # If still failing, there might be an issue - log but don't force
@@ -1003,8 +1093,8 @@ class PersistenceManager:
         # Remove leading slashes
         clean_path = path.lstrip("/")
 
-        # Reject paths containing .. components
-        if ".." in clean_path:
+        # Reject paths containing .. path components, but allow ".." in filenames.
+        if any(part == ".." for part in clean_path.split("/")):
             raise ValueError(f"Path '{path}' contains directory traversal sequences")
 
         # Build the full path
