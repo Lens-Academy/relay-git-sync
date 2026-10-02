@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 import git
 
+from authorship import AuthorTracker, format_authors_body
 from git_config import GitConnectorConfig
 from models import get_s3rn_resource_category
 from s3rn import (
@@ -174,6 +175,9 @@ class PersistenceManager:
         self.local_file_state: Dict[str, Dict[str, Dict]] = (
             {}
         )  # keyed by relay_id then folder_id then path
+
+        # Who changed which file since the last commit (see authorship.py)
+        self.authorship = AuthorTracker()
 
         # In-memory resource index (built from existing data sources)
         self.resource_index: Dict[str, Dict[str, Dict]] = {}  # keyed by relay_id then resource_id
@@ -525,6 +529,9 @@ class PersistenceManager:
                 logger.error(f"Error loading local state for relay {relay_id}: {e}")
                 self.local_file_state[relay_id] = {}
 
+        # Author-tracking baselines (loaded once per relay; see AuthorTracker.load)
+        self.authorship.load(relay_id, self.get_state_dir(relay_id))
+
         # Build resource index from loaded data
         with self.resource_index_lock:
             self._build_resource_index(relay_id)
@@ -551,6 +558,8 @@ class PersistenceManager:
                 json.dump(self.local_file_state.get(relay_id, {}), f, indent=2)
         except Exception as e:
             logger.error(f"Error saving local state for relay {relay_id}: {e}")
+
+        self.authorship.save(relay_id, self.get_state_dir(relay_id))
 
         # Rebuild resource index after saving data
         with self.resource_index_lock:
@@ -729,12 +738,20 @@ class PersistenceManager:
                     # Add all changes using safe git operation
                     self._safe_git_operation(lambda: git_repo.git.add(A=True))
 
-                    # Create commit message
+                    # Create commit message, naming who changed the staged files
                     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
                     commit_msg = f"Auto-sync: {timestamp}"
+                    authors = self._take_commit_authors(repo_key, git_repo)
+                    authors_body = format_authors_body(authors)
+                    if authors_body:
+                        commit_msg = f"{commit_msg}\n\n{authors_body}"
 
                     # Commit changes using safe git operation
-                    self._safe_git_operation(lambda: git_repo.index.commit(commit_msg))
+                    try:
+                        self._safe_git_operation(lambda: git_repo.index.commit(commit_msg))
+                    except Exception:
+                        self.authorship.restore(repo_key, authors)
+                        raise
                     print(f"Git commit for repository {repo_key}: {commit_msg}")
                     committed_any = True
 
@@ -759,6 +776,26 @@ class PersistenceManager:
                 logger.error(f"Git commit traceback: {traceback.format_exc()}")
 
         return committed_any
+
+    def _take_commit_authors(self, repo_key: str, git_repo: git.Repo) -> Dict[str, set]:
+        """Authors of the files staged for this commit. Best effort: a git
+        error here costs the attribution, never the commit."""
+        try:
+            staged = [
+                p for p in git_repo.git.diff("--cached", "--name-only", "-z").split("\0") if p
+            ]
+            dirty = [
+                p for p in git_repo.git.diff("--name-only", "-z").split("\0") if p
+            ] + list(git_repo.untracked_files)
+            return self.authorship.take_for_commit(repo_key, staged, dirty)
+        except Exception as e:
+            logger.warning(f"Could not collect commit authors for {repo_key}: {e}")
+            return {}
+
+    def repo_relative_path(self, relay_id: str, folder_id: str, full_path: str) -> str:
+        """Path of an exported file as git names it in its folder repository."""
+        rel = os.path.relpath(full_path, self.get_folder_path(relay_id, folder_id))
+        return rel.replace(os.sep, "/")
 
     def _update_push_backoff(self, repo_key: str, git_repo: git.Repo):
         """Track push convergence so failed retries back off instead of
