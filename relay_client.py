@@ -305,11 +305,13 @@ class RelayClient:
                 text_content = doc.get("contents", type=Text)
                 parsed_content["content"] = str(text_content)
                 parsed_content["type"] = "document"
+                self._notify_doc_observer(resource, doc)
             elif "edges" in doc.keys() and "nodes" in doc.keys():
                 # Canvas document with edges and nodes
                 canvas_data = self._export_canvas_data(doc)
                 parsed_content["content"] = json.dumps(canvas_data, indent=2, sort_keys=True)
                 parsed_content["type"] = "canvas"
+                self._notify_doc_observer(resource, doc)
             else:
                 parsed_content["type"] = "unknown"
 

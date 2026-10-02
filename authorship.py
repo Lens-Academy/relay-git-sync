@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,9 @@ STATE_VECTORS_FILE = "document_state_vectors.json"
 USERS_MAP_KEY = "users"
 MAX_FILE_LINES = 50
 TRAILER_DOMAIN = "relay.invalid"
+# Baselines change on nearly every export; write them at most this often.
+# A crash loses at most this window, which only re-credits those writers once.
+SAVE_INTERVAL_S = 30.0
 
 
 def _read_varuint(data: bytes, pos: int) -> Tuple[int, int]:
@@ -129,7 +133,7 @@ def format_authors_body(changes: Dict[str, Set[str]]) -> str:
     labels: Dict[str, str] = {}
     for actors in changes.values():
         for actor in actors:
-            labels[actor] = _clean(display_actor(actor))
+            labels[actor] = _clean(display_actor(actor)) or "unknown"
     ordered = sorted(set(labels.values()), key=str.lower)
 
     lines: List[str] = [f"Authors: {', '.join(ordered)}", ""]
@@ -152,6 +156,8 @@ class AuthorTracker:
         # relay_id -> doc_id -> {clientID(str): clock}; persisted
         self._baselines: Dict[str, Dict[str, Dict[str, int]]] = {}
         self._loaded_relays: Set[str] = set()
+        self._dirty: Set[str] = set()
+        self._last_save: Dict[str, float] = {}
         # doc_id -> (state vector, clientID -> actor) from the latest fetch
         self._candidates: Dict[Tuple[str, str], Tuple[Dict[int, int], Dict[int, str]]] = {}
         # repo_key -> repo-relative path -> actor keys, awaiting a commit
@@ -176,10 +182,20 @@ class AuthorTracker:
                     logger.error(f"Error loading state vectors for relay {relay_id}: {e}")
             self._baselines.setdefault(relay_id, {}).update(baselines)
 
-    def save(self, relay_id: str, state_dir: str):
+    def save(self, relay_id: str, state_dir: str, force: bool = False):
         with self._lock:
             if relay_id not in self._loaded_relays:
                 return  # never loaded: writing now could clobber the file
+            if relay_id not in self._dirty:
+                return
+            now = time.monotonic()
+            if (
+                not force
+                and now - self._last_save.get(relay_id, -SAVE_INTERVAL_S) < SAVE_INTERVAL_S
+            ):
+                return
+            self._dirty.discard(relay_id)
+            self._last_save[relay_id] = now
             data = json.dumps(self._baselines.get(relay_id, {}))
         try:
             os.makedirs(state_dir, exist_ok=True)
@@ -189,6 +205,8 @@ class AuthorTracker:
                 f.write(data)
             os.replace(tmp, path)
         except Exception as e:
+            with self._lock:
+                self._dirty.add(relay_id)
             logger.error(f"Error saving state vectors for relay {relay_id}: {e}")
 
     # --- recording -------------------------------------------------------
@@ -220,6 +238,16 @@ class AuthorTracker:
                 changed.add(actors[client])
         return changed
 
+    def _set_baseline(self, relay_id, doc_id, state_vector, actors):
+        # Only registered clients are kept: they are all attribution needs,
+        # and the server's own clientID or a client that registers later
+        # (its writes are then credited at its first registered export)
+        # would only grow the file.
+        self._baselines.setdefault(relay_id, {})[doc_id] = {
+            str(client): clock for client, clock in state_vector.items() if client in actors
+        }
+        self._dirty.add(relay_id)
+
     def confirm(
         self,
         repo_key: str,
@@ -238,9 +266,7 @@ class AuthorTracker:
             changed = self._changed_actors(relay_id, doc_id, state_vector, actors, is_new_file)
             if changed:
                 self._pending.setdefault(repo_key, {}).setdefault(path, set()).update(changed)
-            self._baselines.setdefault(relay_id, {})[doc_id] = {
-                str(client): clock for client, clock in state_vector.items()
-            }
+            self._set_baseline(relay_id, doc_id, state_vector, actors)
             return changed
 
     def advance(self, relay_id: str, doc_id: str):
@@ -250,10 +276,8 @@ class AuthorTracker:
             candidate = self._candidates.pop((relay_id, doc_id), None)
             if candidate is None:
                 return
-            state_vector, _ = candidate
-            self._baselines.setdefault(relay_id, {})[doc_id] = {
-                str(client): clock for client, clock in state_vector.items()
-            }
+            state_vector, actors = candidate
+            self._set_baseline(relay_id, doc_id, state_vector, actors)
 
     def forget(self, relay_id: str, doc_id: str):
         """Drop an unused candidate (e.g. the export failed) so it cannot be
@@ -278,6 +302,13 @@ class AuthorTracker:
             if keep:
                 self._pending[repo_key] = keep
             return taken
+
+    def rename(self, repo_key: str, old_path: str, new_path: str):
+        """A file moved before its authors were committed: carry them over."""
+        with self._lock:
+            repo = self._pending.get(repo_key)
+            if repo and old_path in repo:
+                repo.setdefault(new_path, set()).update(repo.pop(old_path))
 
     def restore(self, repo_key: str, changes: Dict[str, Set[str]]):
         """Put authors back after a failed commit."""

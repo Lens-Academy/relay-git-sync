@@ -781,12 +781,16 @@ class PersistenceManager:
         """Authors of the files staged for this commit. Best effort: a git
         error here costs the attribution, never the commit."""
         try:
-            staged = [
-                p for p in git_repo.git.diff("--cached", "--name-only", "-z").split("\0") if p
-            ]
-            dirty = [
-                p for p in git_repo.git.diff("--name-only", "-z").split("\0") if p
-            ] + list(git_repo.untracked_files)
+            # --no-renames: a staged rename must list its old path too.
+            # Under git_lock like every other git call: diff may refresh the index.
+            staged_out = self._safe_git_operation(
+                lambda: git_repo.git.diff("--cached", "--name-only", "--no-renames", "-z")
+            )
+            dirty_out = self._safe_git_operation(
+                lambda: git_repo.git.diff("--name-only", "--no-renames", "-z")
+            )
+            staged = [p for p in staged_out.split("\0") if p]
+            dirty = [p for p in dirty_out.split("\0") if p] + list(git_repo.untracked_files)
             return self.authorship.take_for_commit(repo_key, staged, dirty)
         except Exception as e:
             logger.warning(f"Could not collect commit authors for {repo_key}: {e}")
@@ -1295,6 +1299,14 @@ class PersistenceManager:
 
             # Move the file
             shutil.move(old_full_path, new_full_path)
+
+            # Authors of edits not committed yet follow the file
+            repo_dir = self.get_folder_path(relay_id, folder_uuid)
+            self.authorship.rename(
+                f"{relay_id}/{folder_uuid}",
+                os.path.relpath(old_full_path, repo_dir).replace(os.sep, "/"),
+                os.path.relpath(new_full_path, repo_dir).replace(os.sep, "/"),
+            )
 
             # Update local state using folder_uuid for state tracking
             if relay_id in self.local_file_state and folder_uuid in self.local_file_state[relay_id]:

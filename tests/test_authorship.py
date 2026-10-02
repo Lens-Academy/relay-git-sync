@@ -23,6 +23,7 @@ from authorship import (
     display_actor,
     format_authors_body,
 )
+from models import SyncRequest
 from persistence import PersistenceManager
 from relay_client import RelayClient
 from s3rn import S3RN, S3RemoteDocument
@@ -32,8 +33,10 @@ RELAY_ID = "11111111-1111-4111-8111-111111111111"
 FOLDER_ID = "22222222-2222-4222-8222-222222222222"
 DOC_ID = "33333333-3333-4333-8333-333333333333"
 DOC2_ID = "44444444-4444-4444-8444-444444444444"
+DOC3_ID = "55555555-5555-4555-8555-555555555555"
 DOC_PATH = "/Lens Edu/modules/Intro.md"
 DOC2_PATH = "/Lens Edu/Lenses/Risks.md"
+DOC3_PATH = "/Lens Edu/articles/New.md"
 
 LUC = 1001
 AI = 2002
@@ -125,6 +128,12 @@ def test_self_reported_name_cannot_forge_message_lines():
     assert sum(line.startswith("Co-authored-by:") for line in lines) == 1
 
 
+def test_name_that_cleans_to_nothing_shows_unknown():
+    body = format_authors_body({"a.md": {"human:<<<"}})
+    assert body.startswith("Authors: unknown\n")
+    assert "Co-authored-by: unknown <unknown@relay.invalid>" in body
+
+
 def test_file_list_is_capped():
     body = format_authors_body({f"f{i:03}.md": {"human:A"} for i in range(60)})
     assert "- f049.md: A" in body
@@ -178,6 +187,30 @@ class TestTracker:
         assert taken == {"staged.md": {"a"}}
         assert self.t.take_for_commit("r/f", ["later.md", "stale.md"]) == {"later.md": {"b"}}
 
+    def test_rename_carries_pending_authors(self):
+        self.t.restore("r/f", {"old.md": {"human:A"}})
+        self.t.rename("r/f", "old.md", "new.md")
+        assert self.t.take_for_commit("r/f", ["old.md", "new.md"]) == {"new.md": {"human:A"}}
+
+    def test_saves_are_throttled_and_skipped_when_clean(self, tmp_path):
+        state = str(tmp_path)
+        path = os.path.join(state, "document_state_vectors.json")
+        self.t.load(RELAY_ID, state)
+        self.t.save(RELAY_ID, state)
+        assert not os.path.exists(path)  # nothing changed yet
+        self.relay.edit(LUC, "human:Luc Brinkman", "a")
+        self.observe_and_confirm()
+        self.t.save(RELAY_ID, state)
+        first = open(path).read()
+        self.relay.edit(AI, "ai:opus-5.5:james", "b")
+        self.observe_and_confirm()
+        self.t.save(RELAY_ID, state)
+        assert open(path).read() == first  # within the interval
+        self.t.save(RELAY_ID, state, force=True)
+        assert str(AI) in open(path).read()
+        # Only registered clients are stored.
+        assert str(SERVER) not in open(path).read()
+
     def test_baselines_survive_restart_and_reload(self, tmp_path):
         state = str(tmp_path)
         self.t.load(RELAY_ID, state)
@@ -203,7 +236,11 @@ class TestCommitMessages:
         self.pm = PersistenceManager(self.temp_dir)
         self.relay_client = RelayClient("http://relay.test")
         self.relay_client.dm = MagicMock()
-        self.docs = {DOC_ID: RelayDoc("# Intro\n"), DOC2_ID: RelayDoc("# Risks\n")}
+        self.docs = {
+            DOC_ID: RelayDoc("# Intro\n"),
+            DOC2_ID: RelayDoc("# Risks\n"),
+            DOC3_ID: RelayDoc(),
+        }
         compound = {
             S3RN.get_compound_document_id(S3RemoteDocument(RELAY_ID, FOLDER_ID, d)): d
             for d in self.docs
@@ -217,6 +254,7 @@ class TestCommitMessages:
         self.pm.filemeta_folders[RELAY_ID][FOLDER_ID] = {
             DOC_PATH: {"id": DOC_ID, "type": "markdown"},
             DOC2_PATH: {"id": DOC2_ID, "type": "markdown"},
+            DOC3_PATH: {"id": DOC3_ID, "type": "markdown"},
         }
         self.pm._build_resource_index(RELAY_ID)
         self.repo = self.pm.init_git_repo(RELAY_ID, FOLDER_ID)
@@ -292,3 +330,35 @@ class TestCommitMessages:
         path = os.path.join(self.pm.get_folder_path(RELAY_ID, FOLDER_ID), DOC_PATH.lstrip("/"))
         with open(path, encoding="utf-8") as f:
             assert f.read().endswith("x\n")
+
+    def test_first_export_via_webhook_credits_the_creator(self):
+        # The file was never exported; the doc webhook exports it through the
+        # update path, which must still treat it as a new file.
+        self.docs[DOC3_ID].edit(LUC, "human:Luc Brinkman", "# New\n")
+        self.change(DOC3_ID)
+        assert self.pm.commit_changes()
+        assert "- Lens Edu/articles/New.md: Luc Brinkman" in self.last_message()
+
+    def test_rename_before_commit_keeps_the_authors(self):
+        self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "Welcome.\n")
+        self.change(DOC_ID)
+        resource = S3RemoteDocument(RELAY_ID, FOLDER_ID, DOC_ID)
+        self.pm.move_file(resource, DOC_PATH, "/Lens Edu/modules/Introduction.md")
+        assert self.pm.commit_changes()
+        assert "- Lens Edu/modules/Introduction.md: Luc Brinkman" in self.last_message()
+
+    def test_document_sync_request_path_is_attributed(self):
+        self.docs[DOC_ID].edit(AI, "ai:opus-5.5:james", "AI line.\n")
+        resource = S3RemoteDocument(RELAY_ID, FOLDER_ID, DOC_ID)
+        result = self.engine.process_sync_request(
+            SyncRequest(resource=resource, timestamp=datetime.now(timezone.utc))
+        )
+        assert result.success, result.error
+        assert self.pm.commit_changes()
+        assert "Authors: ai:opus-5.5:james\n" in self.last_message()
+
+        # The baseline moved: a later webhook export does not re-credit the AI.
+        self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "Luc line.\n")
+        self.change(DOC_ID)
+        assert self.pm.commit_changes()
+        assert "Authors: Luc Brinkman\n" in self.last_message()
