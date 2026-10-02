@@ -885,6 +885,9 @@ class PersistenceManager:
             parent_tree = git_repo.head.commit.tree.hexsha
             index_file = os.path.join(git_repo.git_dir, "relay-git-sync-author.index")
             env = {"GIT_INDEX_FILE": index_file}
+            for leftover in (index_file, index_file + ".lock"):  # from a killed run
+                if os.path.exists(leftover):
+                    os.remove(leftover)
             # The identities index.commit (the plain path) would use: git's own
             # commit-tree is stricter and can refuse to guess them.
             config = git_repo.config_reader()
@@ -970,7 +973,7 @@ class PersistenceManager:
                 continue
             if staged != entry.content:
                 continue
-            if not old and not entry.is_new:
+            if not ls and not entry.is_new:
                 # Moved here this tick (or unreadable in HEAD): a line diff
                 # against nothing would re-blame the whole file.
                 continue
@@ -1010,7 +1013,8 @@ class PersistenceManager:
                 lambda: git_repo.git.diff("--name-only", "--no-renames", "-z")
             )
             staged = [p for p in staged_out.split("\0") if p]
-            dirty = [p for p in dirty_out.split("\0") if p] + list(git_repo.untracked_files)
+            untracked = self._safe_git_operation(lambda: list(git_repo.untracked_files))
+            dirty = [p for p in dirty_out.split("\0") if p] + untracked
             return self.authorship.take_for_commit(repo_key, staged, dirty)
         except Exception as e:
             logger.warning(f"Could not collect commit authors for {repo_key}: {e}")

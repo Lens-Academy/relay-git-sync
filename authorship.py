@@ -50,6 +50,8 @@ USERS_MAP_KEY = "users"
 MAX_FILE_LINES = 50
 # Bounds the message even if a doc's "users" map is flooded with names.
 MAX_AUTHORS = 20
+# Self-reported names end up in git idents and trailers; keep them short.
+MAX_LABEL = 80
 TRAILER_DOMAIN = "relay.invalid"
 # Baselines change on nearly every export; write them at most this often.
 # A crash loses at most this window, which only re-credits those writers once.
@@ -135,6 +137,7 @@ def actor_label(actor: str) -> str:
     """Display name safe for commit messages and git author fields. Git
     trims these characters from ident ends and rejects an empty name."""
     label = _clean(display_actor(actor)).strip(" .,:;\"'\\")
+    label = label[:MAX_LABEL].rstrip(" .,:;\"'\\")
     return label if any(ch.isalnum() for ch in label) else "unknown"
 
 

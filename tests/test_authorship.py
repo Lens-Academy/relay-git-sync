@@ -109,6 +109,12 @@ def test_client_actor_map_prefers_human_over_ai_over_raw_id():
     assert actors[AI] == "ai:opus-5.5:james"
 
 
+def test_actor_label_is_capped():
+    from authorship import actor_label
+
+    assert actor_label("human:" + "x" * 500) == "x" * 80
+
+
 def test_display_actor():
     assert display_actor("human:Luc Brinkman") == "Luc Brinkman"
     assert display_actor("human: ") == "unknown"
