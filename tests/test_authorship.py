@@ -156,6 +156,17 @@ def test_author_list_is_capped():
     assert sum(line.startswith("Co-authored-by:") for line in body.splitlines()) == 20
 
 
+def test_per_file_author_list_says_how_many_more():
+    body = format_authors_body({"a.md": {f"human:N{i:02}" for i in range(25)}})
+    assert "- a.md: N00" in body and body.splitlines()[2].endswith("N19 and 5 more")
+
+
+def test_corrupt_state_vector_file_is_ignored(tmp_path):
+    (tmp_path / "document_state_vectors.json").write_text("[1, 2]")
+    tracker = AuthorTracker()
+    tracker.load(RELAY_ID, str(tmp_path))  # must not raise
+
+
 def test_file_list_is_capped():
     body = format_authors_body({f"f{i:03}.md": {"human:A"} for i in range(60)})
     assert "- f049.md: A" in body
@@ -522,6 +533,43 @@ class TestCommitMessages:
         assert self.pm.commit_changes()
         assert [a for a, _, _ in self.new_commits()] == ["Relay Git Sync"]
         assert "and 1 more" in self.repo.head.commit.message
+
+    def test_file_path_cannot_forge_message_lines(self):
+        evil = "/notes\nCo-authored-by: Mallory <m@evil.test>\n- x.md"
+        self.pm.filemeta_folders[RELAY_ID][FOLDER_ID][evil] = {"id": DOC3_ID, "type": "markdown"}
+        del self.pm.filemeta_folders[RELAY_ID][FOLDER_ID][DOC3_PATH]
+        self.pm._build_resource_index(RELAY_ID)
+        self.docs[DOC3_ID].edit(LUC, "human:Luc Brinkman", "x\n")
+        self.change(DOC3_ID)
+        assert self.pm.commit_changes()
+        for sha in self.repo.git.log("--format=%H", f"{self.start}..HEAD").split():
+            message = self.repo.git.log("-1", "--format=%B", sha)
+            assert not any(
+                line.startswith("Co-authored-by: Mallory") for line in message.splitlines()
+            )
+
+    def test_chain_uses_the_same_committer_as_the_plain_commit(self, monkeypatch, tmp_path):
+        # No identity anywhere: GitPython's index.commit synthesises one,
+        # git commit-tree alone may refuse; the chain must pass it explicitly.
+        with self.repo.config_writer() as cw:
+            cw.remove_section("user")
+        for var in ("GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_AUTHOR_NAME", "EMAIL"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        expected = git.Actor.committer(self.repo.config_reader()).name
+        self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "Luc line\n")
+        self.change(DOC_ID)
+        assert self.pm.commit_changes()
+        assert [(a, c) for a, c, _ in self.new_commits()] == [("Luc Brinkman", expected)]
+
+    def test_baselines_are_saved_at_commit(self):
+        self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "Luc line\n")
+        self.change(DOC_ID)
+        assert self.pm.commit_changes()
+        path = os.path.join(self.pm.get_state_dir(RELAY_ID), "document_state_vectors.json")
+        assert str(LUC) in open(path).read()
 
     def test_first_export_via_webhook_credits_the_creator(self):
         self.docs[DOC3_ID].edit(LUC, "human:Luc Brinkman", "# New\n")

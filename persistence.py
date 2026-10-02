@@ -21,6 +21,7 @@ from authorship import (
     MAX_AUTHORS,
     AuthorTracker,
     PendingFile,
+    _clean,
     actor_email,
     actor_label,
     format_authors_body,
@@ -86,7 +87,7 @@ def _lines_body(line_ranges: Dict[str, List[int]], max_files: int = 50) -> str:
             spans.append(f"L{start}" if start == prev else f"L{start}-L{prev}")
             if n is not None:
                 start = prev = n
-        out.append(f"- {path}: {', '.join(spans)}")
+        out.append(f"- {_clean(path)}: {', '.join(spans)}")
     if len(line_ranges) > max_files:
         out.append(f"- ... and {len(line_ranges) - max_files} more files")
     return "Lines written since the last sync:\n" + "\n".join(out)
@@ -823,6 +824,10 @@ class PersistenceManager:
                         self.authorship.restore(repo_key, entries)
                         raise
                     self.authorship.committed(entries.values())
+                    # Persist the moved baselines now, so a redeploy right
+                    # after this commit cannot re-credit these writers.
+                    relay_id = repo_key.split("/", 1)[0]
+                    self.authorship.save(relay_id, self.get_state_dir(relay_id), force=True)
                     print(f"Git commit for repository {repo_key}: {commit_msg}")
                     committed_any = True
 
@@ -880,6 +885,15 @@ class PersistenceManager:
             parent_tree = git_repo.head.commit.tree.hexsha
             index_file = os.path.join(git_repo.git_dir, "relay-git-sync-author.index")
             env = {"GIT_INDEX_FILE": index_file}
+            # The identities index.commit (the plain path) would use: git's own
+            # commit-tree is stricter and can refuse to guess them.
+            config = git_repo.config_reader()
+            bot = git.Actor.author(config)
+            committer = git.Actor.committer(config)
+            ident = {
+                "GIT_COMMITTER_NAME": committer.name,
+                "GIT_COMMITTER_EMAIL": committer.email,
+            }
             try:
                 for rank, author in enumerate(authors):
                     allowed = set(authors[: rank + 1])
@@ -912,7 +926,11 @@ class PersistenceManager:
                         parent,
                         "-m",
                         msg,
-                        env={"GIT_AUTHOR_NAME": label, "GIT_AUTHOR_EMAIL": actor_email(label)},
+                        env={
+                            **ident,
+                            "GIT_AUTHOR_NAME": label,
+                            "GIT_AUTHOR_EMAIL": actor_email(label),
+                        },
                     )
                     parent_tree = tree
             finally:
@@ -921,7 +939,14 @@ class PersistenceManager:
             if parent == head:
                 return False
             if final_tree != parent_tree:
-                parent = git_repo.git.commit_tree(final_tree, "-p", parent, "-m", final_msg)
+                parent = git_repo.git.commit_tree(
+                    final_tree,
+                    "-p",
+                    parent,
+                    "-m",
+                    final_msg,
+                    env={**ident, "GIT_AUTHOR_NAME": bot.name, "GIT_AUTHOR_EMAIL": bot.email},
+                )
             git_repo.git.update_ref("HEAD", parent, head)
             return True
         except Exception as e:

@@ -164,8 +164,9 @@ def format_authors_body(changes: Dict[str, Set[str]]) -> str:
     lines: List[str] = [f"Authors: {', '.join(shown)}{more}", ""]
     paths = sorted(changes)
     for path in paths[:MAX_FILE_LINES]:
-        names = sorted({labels[a] for a in changes[path]}, key=str.lower)[:MAX_AUTHORS]
-        lines.append(f"- {_clean(path)}: {', '.join(names)}")
+        names = sorted({labels[a] for a in changes[path]}, key=str.lower)
+        extra = f" and {len(names) - MAX_AUTHORS} more" if len(names) > MAX_AUTHORS else ""
+        lines.append(f"- {_clean(path)}: {', '.join(names[:MAX_AUTHORS])}{extra}")
     if len(paths) > MAX_FILE_LINES:
         lines.append(f"- ... and {len(paths) - MAX_FILE_LINES} more files")
     lines.append("")
@@ -215,7 +216,10 @@ class AuthorTracker:
             if os.path.exists(path):
                 try:
                     with open(path, "r") as f:
-                        baselines = json.load(f)
+                        loaded = json.load(f)
+                    if not isinstance(loaded, dict):
+                        raise ValueError("not a JSON object")
+                    baselines = {doc: sv for doc, sv in loaded.items() if isinstance(sv, dict)}
                 except Exception as e:
                     logger.error(f"Error loading state vectors for relay {relay_id}: {e}")
             self._baselines.setdefault(relay_id, {}).update(baselines)
