@@ -25,6 +25,19 @@ class RelayClient:
         self.relay_server_url = relay_server_url
         self.relay_server_api_key = relay_server_api_key
         self.dm = self._init_document_manager()
+        # Optional callback(relay_id, doc_id, doc) for every content doc
+        # fetched for export; used to attribute changes (see authorship.py).
+        self.doc_observer = None
+
+    def _notify_doc_observer(self, resource: S3RNType, doc: Doc):
+        """Hand a fetched doc to the observer. Attribution is best effort and
+        must never break a sync, so observer errors are logged and dropped."""
+        if self.doc_observer is None:
+            return
+        try:
+            self.doc_observer(S3RN.get_relay_id(resource), resource.get_resource_id(), doc)
+        except Exception as e:
+            logger.warning(f"Author tracking failed for {resource}: {e}")
 
     def _init_document_manager(self) -> DocumentManager:
         """Initialize DocumentManager with configurable server and authentication"""
@@ -80,6 +93,7 @@ class RelayClient:
 
             # Check if it has content
             if "contents" in doc.keys():
+                self._notify_doc_observer(resource, doc)
                 text_content = doc.get("contents", type=Text)
                 return str(text_content)
 
@@ -113,6 +127,7 @@ class RelayClient:
 
             # Export canvas data
             canvas_data = self._export_canvas_data(doc)
+            self._notify_doc_observer(resource, doc)
 
             # Convert to JSON string with consistent key ordering
             return json.dumps(canvas_data, indent=2, sort_keys=True)
@@ -290,11 +305,13 @@ class RelayClient:
                 text_content = doc.get("contents", type=Text)
                 parsed_content["content"] = str(text_content)
                 parsed_content["type"] = "document"
+                self._notify_doc_observer(resource, doc)
             elif "edges" in doc.keys() and "nodes" in doc.keys():
                 # Canvas document with edges and nodes
                 canvas_data = self._export_canvas_data(doc)
                 parsed_content["content"] = json.dumps(canvas_data, indent=2, sort_keys=True)
                 parsed_content["type"] = "canvas"
+                self._notify_doc_observer(resource, doc)
             else:
                 parsed_content["type"] = "unknown"
 

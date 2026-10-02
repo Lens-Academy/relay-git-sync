@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import atexit
+import difflib
 import glob
 import json
 import logging
@@ -8,6 +9,7 @@ import os
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -15,6 +17,15 @@ from typing import Any, Dict, List, Optional
 
 import git
 
+from authorship import (
+    MAX_AUTHORS,
+    AuthorTracker,
+    PendingFile,
+    _clean,
+    actor_email,
+    actor_label,
+    format_authors_body,
+)
 from git_config import GitConnectorConfig
 from models import get_s3rn_resource_category
 from s3rn import (
@@ -28,6 +39,58 @@ from s3rn import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _partial_text(plan: dict, allowed: set):
+    """The file with only the changed lines of ``allowed`` owners applied to
+    the HEAD version, hunk by hunk: a hunk keeps its old lines until one of
+    its new lines is allowed, then shows exactly its allowed new lines in
+    final order. With every owner allowed this is the final text, except
+    for lines nobody owns, which arrive with the closing bot commit.
+    Returns None while the file is still unchanged from HEAD."""
+    old = plan["old_lines"]
+    new = plan["new_lines"]
+    owners = plan["owners"]
+    out = []
+    changed = False
+    for tag, i1, i2, j1, j2 in plan["opcodes"]:
+        if tag == "equal":
+            out.extend(old[i1:i2])
+            continue
+        mine = [new[j] for j in range(j1, j2) if owners[j] in allowed]
+        if mine:
+            out.extend(mine)
+            changed = True
+        else:
+            out.extend(old[i1:i2])
+    return "".join(out) if changed else None
+
+
+def _read_blob(git_repo: git.Repo, rev_path: str) -> str:
+    raw = git_repo.git.cat_file(
+        "blob", rev_path, stdout_as_string=False, strip_newline_in_stdout=False
+    )
+    return raw.decode("utf-8")
+
+
+def _lines_body(line_ranges: Dict[str, List[int]], max_files: int = 50) -> str:
+    """Per file "- path: L3-L5, L9", in final-file line numbers."""
+    out = []
+    for path in sorted(line_ranges)[:max_files]:
+        nums = line_ranges[path]
+        spans = []
+        start = prev = nums[0]
+        for n in nums[1:] + [None]:
+            if n is not None and n == prev + 1:
+                prev = n
+                continue
+            spans.append(f"L{start}" if start == prev else f"L{start}-L{prev}")
+            if n is not None:
+                start = prev = n
+        out.append(f"- {_clean(path)}: {', '.join(spans)}")
+    if len(line_ranges) > max_files:
+        out.append(f"- ... and {len(line_ranges) - max_files} more files")
+    return "Lines written since the last sync:\n" + "\n".join(out)
 
 
 class SSHKeyManager:
@@ -174,6 +237,9 @@ class PersistenceManager:
         self.local_file_state: Dict[str, Dict[str, Dict]] = (
             {}
         )  # keyed by relay_id then folder_id then path
+
+        # Who changed which file since the last commit (see authorship.py)
+        self.authorship = AuthorTracker()
 
         # In-memory resource index (built from existing data sources)
         self.resource_index: Dict[str, Dict[str, Dict]] = {}  # keyed by relay_id then resource_id
@@ -525,6 +591,9 @@ class PersistenceManager:
                 logger.error(f"Error loading local state for relay {relay_id}: {e}")
                 self.local_file_state[relay_id] = {}
 
+        # Author-tracking baselines (loaded once per relay; see AuthorTracker.load)
+        self.authorship.load(relay_id, self.get_state_dir(relay_id))
+
         # Build resource index from loaded data
         with self.resource_index_lock:
             self._build_resource_index(relay_id)
@@ -551,6 +620,8 @@ class PersistenceManager:
                 json.dump(self.local_file_state.get(relay_id, {}), f, indent=2)
         except Exception as e:
             logger.error(f"Error saving local state for relay {relay_id}: {e}")
+
+        self.authorship.save(relay_id, self.get_state_dir(relay_id))
 
         # Rebuild resource index after saving data
         with self.resource_index_lock:
@@ -729,12 +800,34 @@ class PersistenceManager:
                     # Add all changes using safe git operation
                     self._safe_git_operation(lambda: git_repo.git.add(A=True))
 
-                    # Create commit message
+                    # Create commit message, naming who changed the staged files
                     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
                     commit_msg = f"Auto-sync: {timestamp}"
+                    entries = self._take_commit_authors(repo_key, git_repo)
+                    authors_body = format_authors_body(
+                        {path: e.actors for path, e in entries.items()}
+                    )
+                    if authors_body:
+                        commit_msg = f"{commit_msg}\n\n{authors_body}"
 
-                    # Commit changes using safe git operation
-                    self._safe_git_operation(lambda: git_repo.index.commit(commit_msg))
+                    # Commit changes using safe git operation: one commit per
+                    # author holding that author's lines, so git blame shows
+                    # who wrote each line; the plain single commit otherwise.
+                    try:
+                        if not self._safe_git_operation(
+                            lambda: self._write_author_commits(
+                                repo_key, git_repo, entries, timestamp, commit_msg
+                            )
+                        ):
+                            self._safe_git_operation(lambda: git_repo.index.commit(commit_msg))
+                    except Exception:
+                        self.authorship.restore(repo_key, entries)
+                        raise
+                    self.authorship.committed(entries.values())
+                    # Persist the moved baselines now, so a redeploy right
+                    # after this commit cannot re-credit these writers.
+                    relay_id = repo_key.split("/", 1)[0]
+                    self.authorship.save(relay_id, self.get_state_dir(relay_id), force=True)
                     print(f"Git commit for repository {repo_key}: {commit_msg}")
                     committed_any = True
 
@@ -759,6 +852,178 @@ class PersistenceManager:
                 logger.error(f"Git commit traceback: {traceback.format_exc()}")
 
         return committed_any
+
+    def _write_author_commits(
+        self,
+        repo_key: str,
+        git_repo: git.Repo,
+        entries: Dict[str, PendingFile],
+        timestamp: str,
+        final_msg: str,
+    ) -> bool:
+        """Commit the staged index as a chain: one commit per author holding
+        only that author's lines, then (if anything is left) the bot commit
+        with the full index. The chain always ends at exactly the staged tree.
+
+        Returns False, leaving HEAD untouched, when no line is attributable
+        or anything goes wrong; the caller then makes the plain commit.
+        Must run under git_lock.
+        """
+        try:
+            plans = self._line_plans(git_repo, entries)
+            if not plans:
+                return False
+            authors = sorted(
+                {o for plan in plans.values() for o in plan["changed_owners"]},
+                key=lambda a: (actor_label(a).lower(), a),
+            )
+            if not authors or len(authors) > MAX_AUTHORS:
+                return False  # bounds the chain (and git_lock time) per tick
+            head = git_repo.head.commit.hexsha
+            final_tree = git_repo.git.write_tree()
+            parent = head
+            parent_tree = git_repo.head.commit.tree.hexsha
+            index_file = os.path.join(git_repo.git_dir, "relay-git-sync-author.index")
+            env = {"GIT_INDEX_FILE": index_file}
+            for leftover in (index_file, index_file + ".lock"):  # from a killed run
+                if os.path.exists(leftover):
+                    os.remove(leftover)
+            # The identities index.commit (the plain path) would use: git's own
+            # commit-tree is stricter and can refuse to guess them.
+            config = git_repo.config_reader()
+            bot = git.Actor.author(config)
+            committer = git.Actor.committer(config)
+            ident = {
+                "GIT_COMMITTER_NAME": committer.name,
+                "GIT_COMMITTER_EMAIL": committer.email,
+            }
+            try:
+                for rank, author in enumerate(authors):
+                    allowed = set(authors[: rank + 1])
+                    git_repo.git.read_tree(parent_tree, env=env)
+                    line_ranges = {}
+                    for path, plan in plans.items():
+                        text = _partial_text(plan, allowed)
+                        mine = [n for n in plan["changed_lines"] if plan["owners"][n - 1] == author]
+                        if mine:
+                            line_ranges[path] = mine
+                        if text is None:
+                            continue  # unchanged from HEAD at this stage
+                        with tempfile.TemporaryFile() as stdin:
+                            stdin.write(text.encode("utf-8"))
+                            stdin.seek(0)
+                            blob = git_repo.git.hash_object(
+                                "-w", "--stdin", "--path", path, istream=stdin
+                            )
+                        git_repo.git.update_index(
+                            "--add", "--cacheinfo", f"{plan['mode']},{blob},{path}", env=env
+                        )
+                    tree = git_repo.git.write_tree(env=env)
+                    if tree == parent_tree:
+                        continue
+                    label = actor_label(author)
+                    msg = f"Auto-sync: {timestamp} ({label})\n\n" + _lines_body(line_ranges)
+                    parent = git_repo.git.commit_tree(
+                        tree,
+                        "-p",
+                        parent,
+                        "-m",
+                        msg,
+                        env={
+                            **ident,
+                            "GIT_AUTHOR_NAME": label,
+                            "GIT_AUTHOR_EMAIL": actor_email(label),
+                        },
+                    )
+                    parent_tree = tree
+            finally:
+                if os.path.exists(index_file):
+                    os.remove(index_file)
+            if parent == head:
+                return False
+            if final_tree != parent_tree:
+                parent = git_repo.git.commit_tree(
+                    final_tree,
+                    "-p",
+                    parent,
+                    "-m",
+                    final_msg,
+                    env={**ident, "GIT_AUTHOR_NAME": bot.name, "GIT_AUTHOR_EMAIL": bot.email},
+                )
+            git_repo.git.update_ref("HEAD", parent, head)
+            return True
+        except Exception as e:
+            logger.warning(f"Per-author commits failed for {repo_key}, committing as one: {e}")
+            return False
+
+    def _line_plans(self, git_repo: git.Repo, entries: Dict[str, PendingFile]) -> Dict[str, dict]:
+        """For each staged file with known line owners whose staged content is
+        exactly the export those owners describe: old text, new text, owners."""
+        plans = {}
+        for path, entry in entries.items():
+            if not entry.owners or not any(entry.owners):
+                continue
+            try:
+                # Fails for a path staged as deleted: skip just that file.
+                staged = _read_blob(git_repo, f":{path}")
+                ls = git_repo.git.ls_tree("HEAD", "--", path)
+                mode = ls.split()[0] if ls else "100644"
+                old = _read_blob(git_repo, f"HEAD:{path}") if ls else ""
+            except (git.exc.GitCommandError, UnicodeDecodeError):
+                continue
+            if staged != entry.content:
+                continue
+            if not ls and not entry.is_new:
+                # Moved here this tick (or unreadable in HEAD): a line diff
+                # against nothing would re-blame the whole file.
+                continue
+            old_lines = old.splitlines(keepends=True)
+            new_lines = staged.splitlines(keepends=True)
+            opcodes = difflib.SequenceMatcher(
+                None, old_lines, new_lines, autojunk=False
+            ).get_opcodes()
+            # Line numbers (1-based) this tick actually changes
+            changed_lines = [
+                j + 1 for tag, _, _, j1, j2 in opcodes if tag != "equal" for j in range(j1, j2)
+            ]
+            changed_owners = {entry.owners[n - 1] for n in changed_lines} - {None}
+            if not changed_owners:
+                continue
+            plans[path] = {
+                "old_lines": old_lines,
+                "new_lines": new_lines,
+                "opcodes": opcodes,
+                "owners": entry.owners,
+                "changed_lines": changed_lines,
+                "changed_owners": changed_owners,
+                "mode": mode,
+            }
+        return plans
+
+    def _take_commit_authors(self, repo_key: str, git_repo: git.Repo) -> Dict[str, PendingFile]:
+        """Authors of the files staged for this commit. Best effort: a git
+        error here costs the attribution, never the commit."""
+        try:
+            # --no-renames: a staged rename must list its old path too.
+            # Under git_lock like every other git call: diff may refresh the index.
+            staged_out = self._safe_git_operation(
+                lambda: git_repo.git.diff("--cached", "--name-only", "--no-renames", "-z")
+            )
+            dirty_out = self._safe_git_operation(
+                lambda: git_repo.git.diff("--name-only", "--no-renames", "-z")
+            )
+            staged = [p for p in staged_out.split("\0") if p]
+            untracked = self._safe_git_operation(lambda: list(git_repo.untracked_files))
+            dirty = [p for p in dirty_out.split("\0") if p] + untracked
+            return self.authorship.take_for_commit(repo_key, staged, dirty)
+        except Exception as e:
+            logger.warning(f"Could not collect commit authors for {repo_key}: {e}")
+            return {}
+
+    def repo_relative_path(self, relay_id: str, folder_id: str, full_path: str) -> str:
+        """Path of an exported file as git names it in its folder repository."""
+        rel = os.path.relpath(full_path, self.get_folder_path(relay_id, folder_id))
+        return rel.replace(os.sep, "/")
 
     def _update_push_backoff(self, repo_key: str, git_repo: git.Repo):
         """Track push convergence so failed retries back off instead of
@@ -1258,6 +1523,14 @@ class PersistenceManager:
 
             # Move the file
             shutil.move(old_full_path, new_full_path)
+
+            # Authors of edits not committed yet follow the file
+            repo_dir = self.get_folder_path(relay_id, folder_uuid)
+            self.authorship.rename(
+                f"{relay_id}/{folder_uuid}",
+                os.path.relpath(old_full_path, repo_dir).replace(os.sep, "/"),
+                os.path.relpath(new_full_path, repo_dir).replace(os.sep, "/"),
+            )
 
             # Update local state using folder_uuid for state tracking
             if relay_id in self.local_file_state and folder_uuid in self.local_file_state[relay_id]:

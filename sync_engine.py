@@ -39,6 +39,8 @@ class SyncEngine:
         self.relay_client = relay_client
         self.persistence_manager = persistence_manager or PersistenceManager(data_dir)
         self.folder_sync_locks: Dict[str, threading.Lock] = {}
+        # Every exported content doc passes through the author tracker
+        self.relay_client.doc_observer = self.persistence_manager.authorship.observe
 
     def process_document_change(
         self, relay_id: str, resource_id: str, timestamp: datetime
@@ -169,7 +171,13 @@ class SyncEngine:
                                 self.persistence_manager.document_hashes[relay_id][
                                     resource_id
                                 ] = doc_hash
+                            else:
+                                # Export failed: keep the baseline so the
+                                # retry still attributes these changes.
+                                self.persistence_manager.authorship.forget(relay_id, resource_id)
                         else:
+                            # Already exported: nothing new reaches git.
+                            self.persistence_manager.authorship.advance(relay_id, resource_id)
                             operations = []
                     else:
                         operations = []
@@ -254,6 +262,10 @@ class SyncEngine:
                     # process_document_change).
                     if operation is not None and operation.completed and not operation.error:
                         self.persistence_manager.document_hashes[relay_id][doc_uuid] = doc_hash
+                    else:
+                        self.persistence_manager.authorship.forget(relay_id, doc_uuid)
+                else:
+                    self.persistence_manager.authorship.advance(relay_id, doc_uuid)
 
             # Handle canvas document
             elif parsed_content.get("type") == "canvas":
@@ -276,6 +288,10 @@ class SyncEngine:
                     # process_document_change).
                     if operation is not None and operation.completed and not operation.error:
                         self.persistence_manager.document_hashes[relay_id][canvas_uuid] = doc_hash
+                    else:
+                        self.persistence_manager.authorship.forget(relay_id, canvas_uuid)
+                else:
+                    self.persistence_manager.authorship.advance(relay_id, canvas_uuid)
             else:
                 print(f"Document {resource} has no recognized content type")
 
@@ -633,8 +649,15 @@ class SyncEngine:
             logger.warning(f"Error reading file {full_path} for hash comparison: {e}")
             return True  # Error reading file, assume update needed
 
-    def _record_exported_hash(self, document_resource: S3RNType, content: str):
-        """Record the hash of a successfully exported document/canvas.
+    def _record_exported_hash(
+        self,
+        document_resource: S3RNType,
+        content: str,
+        full_path: Optional[str] = None,
+        is_new_file: bool = False,
+    ):
+        """Record the hash of a successfully exported document/canvas, and
+        attribute the export to whoever changed the doc since the last one.
 
         Must be called only after write_file_content succeeded: a hash recorded
         for content that never reached disk would make should_update_file skip
@@ -646,6 +669,30 @@ class SyncEngine:
         self.persistence_manager.document_hashes.setdefault(relay_id, {})[doc_id] = (
             hashlib.sha256(content.encode("utf-8")).hexdigest()
         )
+        if full_path:
+            # Attribution is best effort: it must never fail an export.
+            try:
+                folder_id = S3RN.get_folder_id(document_resource)
+                self.persistence_manager.authorship.confirm(
+                    f"{relay_id}/{folder_id}",
+                    relay_id,
+                    doc_id,
+                    self.persistence_manager.repo_relative_path(relay_id, folder_id, full_path),
+                    # Line attribution is for text documents, not canvas JSON
+                    content=None if isinstance(document_resource, S3RemoteCanvas) else content,
+                    is_new_file=is_new_file,
+                )
+            except Exception as e:
+                logger.warning(f"Author tracking failed for {doc_id}: {e}")
+
+    def _exported_file_exists(self, document_resource: S3RNType, path: str) -> bool:
+        try:
+            relay_id = S3RN.get_relay_id(document_resource)
+            folder_id = S3RN.get_folder_id(document_resource)
+            folder_path = self.persistence_manager.get_folder_path_with_prefix(relay_id, folder_id)
+            return os.path.exists(self.persistence_manager._sanitize_path(path, folder_path))
+        except Exception:
+            return True  # unknown: claim nobody rather than every past writer
 
     def execute_sync_operation(self, relay_id: str, operation: SyncOperation):
         """Execute a sync operation"""
@@ -734,7 +781,7 @@ class SyncEngine:
             full_path = self.persistence_manager.write_file_content(
                 document_resource, path, content, file_hash
             )
-            self._record_exported_hash(document_resource, content)
+            self._record_exported_hash(document_resource, content, full_path, is_new_file=True)
         else:
             # Regular document/text content
             content = self.relay_client.fetch_document_content(document_resource)
@@ -750,7 +797,7 @@ class SyncEngine:
             full_path = self.persistence_manager.write_file_content(
                 document_resource, path, content, file_hash
             )
-            self._record_exported_hash(document_resource, content)
+            self._record_exported_hash(document_resource, content, full_path, is_new_file=True)
 
         print(f"Created {full_path}")
 
@@ -766,6 +813,10 @@ class SyncEngine:
             full_path = self.persistence_manager.create_directory(folder_resource, path)
             print(f"Updated directory {full_path}")
             return
+
+        # A webhook for a doc not exported yet lands here, not in create:
+        # its first export must still credit the doc's writers.
+        is_new_file = not self._exported_file_exists(document_resource, path)
 
         # Fetch content based on resource type
         if isinstance(document_resource, S3RemoteFile):
@@ -808,7 +859,9 @@ class SyncEngine:
                 full_path = self.persistence_manager.write_file_content(
                     document_resource, path, content, file_hash
                 )
-                self._record_exported_hash(document_resource, content)
+                self._record_exported_hash(
+                    document_resource, content, full_path, is_new_file=is_new_file
+                )
 
                 print(f"Updated {full_path}")
             else:
@@ -826,7 +879,9 @@ class SyncEngine:
                 full_path = self.persistence_manager.write_file_content(
                     document_resource, path, content, file_hash
                 )
-                self._record_exported_hash(document_resource, content)
+                self._record_exported_hash(
+                    document_resource, content, full_path, is_new_file=is_new_file
+                )
 
                 print(f"Updated {full_path}")
             else:
