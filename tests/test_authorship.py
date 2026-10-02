@@ -500,6 +500,29 @@ class TestCommitMessages:
         assert "Authors:" not in self.repo.head.commit.message
         self.assert_head_matches_relay()
 
+    def test_deleted_pending_file_does_not_cost_the_others_their_blame(self):
+        self.docs[DOC2_ID].edit(OBSIDIAN, "idheqwn0f6k0xxt", "x\n")
+        self.change(DOC2_ID)
+        os.remove(os.path.join(self.pm.get_folder_path(RELAY_ID, FOLDER_ID), DOC2_PATH.lstrip("/")))
+        self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "Luc line\n")
+        self.change(DOC_ID)
+        assert self.pm.commit_changes()
+        assert self.blame(DOC_PATH)[-1] == ("Luc Brinkman", "Luc line")
+
+    def test_name_git_would_reject_still_commits(self):
+        self.docs[DOC_ID].edit(LUC, 'human:"""', "quoted\n")
+        self.change(DOC_ID)
+        assert self.pm.commit_changes()
+        assert self.blame(DOC_PATH)[-1] == ("unknown", "quoted")
+
+    def test_too_many_authors_fall_back_to_one_commit(self):
+        for n in range(21):
+            self.docs[DOC_ID].edit(5000 + n, f"human:Person {n:02}", f"line {n}\n")
+        self.change(DOC_ID)
+        assert self.pm.commit_changes()
+        assert [a for a, _, _ in self.new_commits()] == ["Relay Git Sync"]
+        assert "and 1 more" in self.repo.head.commit.message
+
     def test_first_export_via_webhook_credits_the_creator(self):
         self.docs[DOC3_ID].edit(LUC, "human:Luc Brinkman", "# New\n")
         self.change(DOC3_ID)

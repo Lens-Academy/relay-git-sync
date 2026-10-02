@@ -678,7 +678,8 @@ class SyncEngine:
                     relay_id,
                     doc_id,
                     self.persistence_manager.repo_relative_path(relay_id, folder_id, full_path),
-                    content=content,
+                    # Line attribution is for text documents, not canvas JSON
+                    content=None if isinstance(document_resource, S3RemoteCanvas) else content,
                     is_new_file=is_new_file,
                 )
             except Exception as e:

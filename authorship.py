@@ -132,8 +132,10 @@ def _clean(text: str) -> str:
 
 
 def actor_label(actor: str) -> str:
-    """Display name safe for commit messages and git author fields."""
-    return _clean(display_actor(actor)) or "unknown"
+    """Display name safe for commit messages and git author fields. Git
+    trims these characters from ident ends and rejects an empty name."""
+    label = _clean(display_actor(actor)).strip(" .,:;\"'\\")
+    return label if any(ch.isalnum() for ch in label) else "unknown"
 
 
 def actor_email(label: str) -> str:

@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 import git
 
 from authorship import (
+    MAX_AUTHORS,
     AuthorTracker,
     PendingFile,
     actor_email,
@@ -46,13 +47,12 @@ def _partial_text(plan: dict, allowed: set):
     final order. With every owner allowed this is the final text, except
     for lines nobody owns, which arrive with the closing bot commit.
     Returns None while the file is still unchanged from HEAD."""
-    old = plan["old"].splitlines(keepends=True)
-    new = plan["new"].splitlines(keepends=True)
+    old = plan["old_lines"]
+    new = plan["new_lines"]
     owners = plan["owners"]
     out = []
     changed = False
-    matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+    for tag, i1, i2, j1, j2 in plan["opcodes"]:
         if tag == "equal":
             out.extend(old[i1:i2])
             continue
@@ -869,9 +869,11 @@ class PersistenceManager:
             if not plans:
                 return False
             authors = sorted(
-                {o for plan in plans.values() for o in plan["owners"] if o is not None},
+                {o for plan in plans.values() for o in plan["changed_owners"]},
                 key=lambda a: (actor_label(a).lower(), a),
             )
+            if not authors or len(authors) > MAX_AUTHORS:
+                return False  # bounds the chain (and git_lock time) per tick
             head = git_repo.head.commit.hexsha
             final_tree = git_repo.git.write_tree()
             parent = head
@@ -885,7 +887,7 @@ class PersistenceManager:
                     line_ranges = {}
                     for path, plan in plans.items():
                         text = _partial_text(plan, allowed)
-                        mine = [n for n, o in enumerate(plan["owners"], 1) if o == author]
+                        mine = [n for n in plan["changed_lines"] if plan["owners"][n - 1] == author]
                         if mine:
                             line_ranges[path] = mine
                         if text is None:
@@ -933,23 +935,41 @@ class PersistenceManager:
         for path, entry in entries.items():
             if not entry.owners or not any(entry.owners):
                 continue
-            staged = _read_blob(git_repo, f":{path}")
+            try:
+                # Fails for a path staged as deleted: skip just that file.
+                staged = _read_blob(git_repo, f":{path}")
+                ls = git_repo.git.ls_tree("HEAD", "--", path)
+                mode = ls.split()[0] if ls else "100644"
+                old = _read_blob(git_repo, f"HEAD:{path}") if ls else ""
+            except (git.exc.GitCommandError, UnicodeDecodeError):
+                continue
             if staged != entry.content:
                 continue
-            mode = "100644"
-            old = ""
-            try:
-                ls = git_repo.git.ls_tree("HEAD", "--", path)
-                if ls:
-                    mode = ls.split()[0]
-                    old = _read_blob(git_repo, f"HEAD:{path}")
-            except git.exc.GitCommandError:
-                pass
             if not old and not entry.is_new:
                 # Moved here this tick (or unreadable in HEAD): a line diff
                 # against nothing would re-blame the whole file.
                 continue
-            plans[path] = {"old": old, "new": staged, "owners": entry.owners, "mode": mode}
+            old_lines = old.splitlines(keepends=True)
+            new_lines = staged.splitlines(keepends=True)
+            opcodes = difflib.SequenceMatcher(
+                None, old_lines, new_lines, autojunk=False
+            ).get_opcodes()
+            # Line numbers (1-based) this tick actually changes
+            changed_lines = [
+                j + 1 for tag, _, _, j1, j2 in opcodes if tag != "equal" for j in range(j1, j2)
+            ]
+            changed_owners = {entry.owners[n - 1] for n in changed_lines} - {None}
+            if not changed_owners:
+                continue
+            plans[path] = {
+                "old_lines": old_lines,
+                "new_lines": new_lines,
+                "opcodes": opcodes,
+                "owners": entry.owners,
+                "changed_lines": changed_lines,
+                "changed_owners": changed_owners,
+                "mode": mode,
+            }
         return plans
 
     def _take_commit_authors(self, repo_key: str, git_repo: git.Repo) -> Dict[str, PendingFile]:
