@@ -535,3 +535,46 @@ class TestCommitMessages:
             ("ai:opus-5.5:james", "AI line."),
             ("Luc Brinkman", "Luc line."),
         ]
+
+
+# --- reconstruction fuzz --------------------------------------------------
+
+
+def test_character_ids_match_pycrdt_under_concurrent_editing():
+    """Three clients insert and delete at random positions, syncing only now
+    and then, so many edits are concurrent. The rebuilt text must equal
+    pycrdt's and every character must belong to the client that typed it
+    (each client types its own alphabet). ASCII only: pycrdt 0.9 indexes
+    Y.Text by UTF-8 bytes; non-ASCII was fuzzed separately with pycrdt 0.14."""
+    import random
+
+    from yjs_attribution import character_ids
+
+    alphabet = {11: "abcdefgh \n", 22: "ABCDEFGH \n", 33: "0123456789\n"}
+    for seed in range(150):
+        rng = random.Random(seed)
+        docs = {c: Doc(client_id=c) for c in alphabet}
+        for d in docs.values():
+            d["contents"] = Text()
+        for _ in range(rng.randint(5, 120)):
+            c = rng.choice(list(alphabet))
+            t = docs[c].get("contents", type=Text)
+            length = len(str(t))
+            if length and rng.random() < 0.3:
+                i = rng.randrange(length)
+                del t[i : i + rng.randint(1, min(5, length - i))]
+            else:
+                chunk = "".join(rng.choice(alphabet[c]) for _ in range(rng.randint(1, 6)))
+                t.insert(rng.randint(0, length), chunk)
+            if rng.random() < 0.15:
+                a, b = rng.sample(list(alphabet), 2)
+                docs[b].apply_update(docs[a].get_update(docs[b].get_state()))
+        for a in docs:
+            for b in docs:
+                if a != b:
+                    docs[b].apply_update(docs[a].get_update(docs[b].get_state()))
+        doc = docs[11]
+        result = character_ids(doc.get_update())
+        assert result is not None and result[0] == str(doc.get("contents", type=Text)), seed
+        for ch, (client, _) in zip(*result):
+            assert ch in alphabet[client], (seed, ch, client)
