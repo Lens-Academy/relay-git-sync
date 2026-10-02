@@ -17,12 +17,19 @@ The Lens relay maps clientIDs to actors in the doc's top-level "users" map
 ClientIDs with no entry (the server's own writes, e.g. link indexing) are
 ignored.
 
+Per character, yjs_attribution.py recovers the clientID that inserted it, so
+each line of an exported file can be given to the actor who wrote most of its
+new characters; the commit timer turns that into one commit per author (see
+PersistenceManager._write_author_commits) so ``git blame`` shows who wrote
+each line.
+
 Flow: RelayClient calls ``observe`` with each fetched Y.Doc; the sync engine
 calls ``confirm`` once that doc's export reached disk (or ``advance`` when the
-export turned out to be a no-op); ``commit_changes`` takes the per-file actors
-for the repository it is about to commit with ``take_for_commit``. The
-baseline only moves on a successful export, so a failed export keeps its
-authors for the retry.
+export turned out to be a no-op); ``commit_changes`` takes the pending entries
+of the files it is about to commit with ``take_for_commit`` and then moves
+each doc's baseline with ``committed``. Baselines are the state at the last
+commit, so everything written since is attributed even across several exports
+or a restart, and a failed export or commit loses nothing.
 """
 
 import json
@@ -31,7 +38,10 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+from yjs_attribution import character_ids, line_owners
 
 logger = logging.getLogger(__name__)
 
@@ -121,9 +131,18 @@ def _clean(text: str) -> str:
     return re.sub(r"[\x00-\x1f\x7f<>]", " ", text).strip()
 
 
-def _trailer(label: str) -> str:
+def actor_label(actor: str) -> str:
+    """Display name safe for commit messages and git author fields."""
+    return _clean(display_actor(actor)) or "unknown"
+
+
+def actor_email(label: str) -> str:
     local = re.sub(r"[^a-z0-9.]+", "-", label.lower()).strip("-.") or "unknown"
-    return f"Co-authored-by: {label} <{local}@{TRAILER_DOMAIN}>"
+    return f"{local}@{TRAILER_DOMAIN}"
+
+
+def _trailer(label: str) -> str:
+    return f"Co-authored-by: {label} <{actor_email(label)}>"
 
 
 def format_authors_body(changes: Dict[str, Set[str]]) -> str:
@@ -135,7 +154,7 @@ def format_authors_body(changes: Dict[str, Set[str]]) -> str:
     labels: Dict[str, str] = {}
     for actors in changes.values():
         for actor in actors:
-            labels[actor] = _clean(display_actor(actor)) or "unknown"
+            labels[actor] = actor_label(actor)
     ordered = sorted(set(labels.values()), key=str.lower)
 
     shown = ordered[:MAX_AUTHORS]
@@ -152,20 +171,33 @@ def format_authors_body(changes: Dict[str, Set[str]]) -> str:
     return "\n".join(lines)
 
 
+@dataclass
+class PendingFile:
+    """An exported file whose authors still await a commit."""
+
+    doc_id: str
+    relay_id: str
+    state_vector: Dict[str, int]  # baseline to store once committed
+    actors: Set[str]  # everyone who wrote since the last commit
+    content: str  # the exported text the line owners refer to
+    owners: Optional[List[Optional[str]]]  # per line; None = unknown
+    is_new: bool = False  # the export created the file
+
+
 class AuthorTracker:
-    """Per-document state-vector baselines plus per-repo pending authors."""
+    """Per-document committed baselines plus per-repo pending files."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        # relay_id -> doc_id -> {clientID(str): clock}; persisted
+        # relay_id -> doc_id -> {clientID(str): clock} at the last commit; persisted
         self._baselines: Dict[str, Dict[str, Dict[str, int]]] = {}
         self._loaded_relays: Set[str] = set()
         self._dirty: Set[str] = set()
         self._last_save: Dict[str, float] = {}
-        # doc_id -> (state vector, clientID -> actor) from the latest fetch
-        self._candidates: Dict[Tuple[str, str], Tuple[Dict[int, int], Dict[int, str]]] = {}
-        # repo_key -> repo-relative path -> actor keys, awaiting a commit
-        self._pending: Dict[str, Dict[str, Set[str]]] = {}
+        # (relay_id, doc_id) -> (doc update, state vector, clientID -> actor)
+        self._candidates: Dict[Tuple[str, str], Tuple[bytes, Dict[int, int], Dict[int, str]]] = {}
+        # repo_key -> repo-relative path -> pending file
+        self._pending: Dict[str, Dict[str, PendingFile]] = {}
 
     # --- persistence -----------------------------------------------------
 
@@ -188,18 +220,13 @@ class AuthorTracker:
 
     def save(self, relay_id: str, state_dir: str, force: bool = False):
         with self._lock:
-            if relay_id not in self._loaded_relays:
-                return  # never loaded: writing now could clobber the file
-            if relay_id not in self._dirty:
-                return
+            if relay_id not in self._loaded_relays or relay_id not in self._dirty:
+                return  # never loaded (would clobber the file) or nothing new
             now = time.monotonic()
-            if (
-                not force
-                and now - self._last_save.get(relay_id, -SAVE_INTERVAL_S) < SAVE_INTERVAL_S
-            ):
+            last = self._last_save.get(relay_id)
+            if not force and last is not None and now - last < SAVE_INTERVAL_S:
                 return
             self._dirty.discard(relay_id)
-            self._last_save[relay_id] = now
             data = json.dumps(self._baselines.get(relay_id, {}))
         try:
             os.makedirs(state_dir, exist_ok=True)
@@ -208,6 +235,8 @@ class AuthorTracker:
             with open(tmp, "w") as f:
                 f.write(data)
             os.replace(tmp, path)
+            with self._lock:
+                self._last_save[relay_id] = now
         except Exception as e:
             with self._lock:
                 self._dirty.add(relay_id)
@@ -216,41 +245,22 @@ class AuthorTracker:
     # --- recording -------------------------------------------------------
 
     def observe(self, relay_id: str, doc_id: str, doc):
-        """Remember a freshly fetched doc's state vector and actor map."""
+        """Remember a freshly fetched doc until its export is settled."""
+        update = doc.get_update()
         state_vector = decode_state_vector(doc.get_state())
         actors = client_actor_map(doc)
         with self._lock:
-            self._candidates[(relay_id, doc_id)] = (state_vector, actors)
+            self._candidates[(relay_id, doc_id)] = (update, state_vector, actors)
 
-    def _changed_actors(
-        self,
-        relay_id: str,
-        doc_id: str,
-        state_vector: Dict[int, int],
-        actors: Dict[int, str],
-        is_new_file: bool,
-    ) -> Set[str]:
-        baseline = self._baselines.get(relay_id, {}).get(doc_id)
-        if baseline is None and not is_new_file:
-            # First sight of an existing file (e.g. right after deploy): no
-            # reference point, so claim nothing rather than everyone ever.
-            return set()
-        baseline = baseline or {}
-        changed: Set[str] = set()
-        for client, clock in state_vector.items():
-            if clock > baseline.get(str(client), 0) and client in actors:
-                changed.add(actors[client])
-        return changed
-
-    def _set_baseline(self, relay_id, doc_id, state_vector, actors):
-        # Only registered clients are kept: they are all attribution needs,
-        # and the server's own clientID or a client that registers later
-        # (its writes are then credited at its first registered export)
-        # would only grow the file.
-        self._baselines.setdefault(relay_id, {})[doc_id] = {
-            str(client): clock for client, clock in state_vector.items() if client in actors
-        }
+    def _set_baseline(self, relay_id, doc_id, state_vector: Dict[str, int]):
+        self._baselines.setdefault(relay_id, {})[doc_id] = state_vector
         self._dirty.add(relay_id)
+
+    @staticmethod
+    def _registered(state_vector: Dict[int, int], actors: Dict[int, str]) -> Dict[str, int]:
+        # Only registered clients matter for attribution; keeping the rest
+        # (the server's own clientID, unregistered sessions) only grows the file.
+        return {str(c): clock for c, clock in state_vector.items() if c in actors}
 
     def confirm(
         self,
@@ -258,34 +268,68 @@ class AuthorTracker:
         relay_id: str,
         doc_id: str,
         path: str,
+        content: Optional[str] = None,
         is_new_file: bool = False,
     ) -> Set[str]:
-        """The doc's export reached disk at repo-relative ``path``: attribute
-        the clients that wrote since the baseline, then move the baseline."""
+        """The doc's export reached disk at repo-relative ``path``: record who
+        wrote since the last commit, and per line of ``content``, whom."""
         with self._lock:
             candidate = self._candidates.pop((relay_id, doc_id), None)
             if candidate is None:
                 return set()
-            state_vector, actors = candidate
-            changed = self._changed_actors(relay_id, doc_id, state_vector, actors, is_new_file)
-            if changed:
-                self._pending.setdefault(repo_key, {}).setdefault(path, set()).update(changed)
-            self._set_baseline(relay_id, doc_id, state_vector, actors)
-            return changed
+            baseline = self._baselines.get(relay_id, {}).get(doc_id)
+        update, state_vector, actors = candidate
+        if baseline is None and not is_new_file:
+            # First sight of an existing file (e.g. right after deploy): no
+            # reference point, so claim nothing rather than everyone ever.
+            changed: Set[str] = set()
+            owners = None
+        else:
+            baseline = baseline or {}
+            changed = {
+                actors[c]
+                for c, clock in state_vector.items()
+                if c in actors and clock > baseline.get(str(c), 0)
+            }
+            owners = None
+            if changed and content is not None:
+                chars = character_ids(update)
+                if chars is not None and chars[0] == content:
+                    owners = line_owners(content, chars[1], baseline, actors)
+                elif chars is not None:
+                    logger.warning(
+                        f"Text reconstruction differs for {doc_id}; per-file authors only"
+                    )
+        entry = PendingFile(
+            doc_id,
+            relay_id,
+            self._registered(state_vector, actors),
+            changed,
+            content or "",
+            owners,
+            is_new_file,
+        )
+        with self._lock:
+            # Newer exports supersede older ones: they are computed against
+            # the same committed baseline, so they already include them.
+            self._pending.setdefault(repo_key, {})[path] = entry
+        return changed
 
     def advance(self, relay_id: str, doc_id: str):
-        """The fetched content equals what is already exported: nobody's
-        writes are visible in git, so just move the baseline."""
+        """The fetched content equals what is already exported. With nothing
+        pending for the doc, git already has it: move the baseline."""
         with self._lock:
             candidate = self._candidates.pop((relay_id, doc_id), None)
             if candidate is None:
                 return
-            state_vector, actors = candidate
-            self._set_baseline(relay_id, doc_id, state_vector, actors)
+            for repo in self._pending.values():
+                if any(e.doc_id == doc_id and e.relay_id == relay_id for e in repo.values()):
+                    return
+            _, state_vector, actors = candidate
+            self._set_baseline(relay_id, doc_id, self._registered(state_vector, actors))
 
     def forget(self, relay_id: str, doc_id: str):
-        """Drop an unused candidate (e.g. the export failed) so it cannot be
-        confirmed later against newer content."""
+        """Drop an unused candidate (e.g. the export failed)."""
         with self._lock:
             self._candidates.pop((relay_id, doc_id), None)
 
@@ -293,32 +337,38 @@ class AuthorTracker:
 
     def take_for_commit(
         self, repo_key: str, staged_paths: Iterable[str], dirty_paths: Iterable[str] = ()
-    ) -> Dict[str, Set[str]]:
-        """Remove and return the authors of ``staged_paths``. Entries for
-        paths written after staging (``dirty_paths``) stay for the next
-        commit; anything else is stale and dropped."""
+    ) -> Dict[str, PendingFile]:
+        """Remove and return the pending files among ``staged_paths``. Files
+        written again after staging (``dirty_paths``) stay pending: their
+        newest export is not in this commit. Anything else is stale."""
         staged = set(staged_paths)
         dirty = set(dirty_paths)
         with self._lock:
             pending = self._pending.pop(repo_key, {})
-            taken = {p: a for p, a in pending.items() if p in staged}
-            keep = {p: a for p, a in pending.items() if p not in staged and p in dirty}
+            taken = {p: e for p, e in pending.items() if p in staged and p not in dirty}
+            keep = {p: e for p, e in pending.items() if p in dirty}
             if keep:
                 self._pending[repo_key] = keep
             return taken
+
+    def committed(self, entries: Iterable[PendingFile]):
+        """These exports are in git now: they become the docs' baselines."""
+        with self._lock:
+            for e in entries:
+                self._set_baseline(e.relay_id, e.doc_id, e.state_vector)
 
     def rename(self, repo_key: str, old_path: str, new_path: str):
         """A file moved before its authors were committed: carry them over."""
         with self._lock:
             repo = self._pending.get(repo_key)
             if repo and old_path in repo:
-                repo.setdefault(new_path, set()).update(repo.pop(old_path))
+                repo[new_path] = repo.pop(old_path)
 
-    def restore(self, repo_key: str, changes: Dict[str, Set[str]]):
-        """Put authors back after a failed commit."""
-        if not changes:
+    def restore(self, repo_key: str, entries: Dict[str, PendingFile]):
+        """Put entries back after a failed commit (newer ones win)."""
+        if not entries:
             return
         with self._lock:
             repo = self._pending.setdefault(repo_key, {})
-            for path, actors in changes.items():
-                repo.setdefault(path, set()).update(actors)
+            for path, entry in entries.items():
+                repo.setdefault(path, entry)

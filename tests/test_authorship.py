@@ -18,6 +18,7 @@ from pycrdt import Array, Doc, Map, Text
 
 from authorship import (
     AuthorTracker,
+    PendingFile,
     client_actor_map,
     decode_state_vector,
     display_actor,
@@ -52,20 +53,35 @@ class RelayDoc:
         self.doc["contents"] = Text(text)
         self.doc["users"] = Map()
 
-    def edit(self, client_id, actor, append):
-        """One client appends text; registers its clientID under ``actor``
-        (None = unregistered, like the server's own writes)."""
+    def fork(self, client_id, actor):
+        """A client that has synced the current state; registers its clientID
+        under ``actor`` (None = unregistered, like the server's own writes)."""
         client = Doc(client_id=client_id)
         client.apply_update(self.doc.get_update())
-        contents = client.get("contents", type=Text)
         users = client.get("users", type=Map)
-        with client.transaction():
-            contents += append
-            if actor is not None:
+        if actor is not None:
+            with client.transaction():
                 if actor not in users:
                     users[actor] = Map({"ids": Array(), "ds": Array(), "meta": Map()})
                 users[actor]["ids"].append(float(client_id))
+        return client
+
+    def merge(self, client):
         self.doc.apply_update(client.get_update(self.doc.get_state()))
+
+    def edit(self, client_id, actor, change):
+        """One client edits: ``change`` is text to append, or a function of
+        the client's Y.Text."""
+        client = self.fork(client_id, actor)
+        contents = client.get("contents", type=Text)
+        if callable(change):
+            change(contents)
+        else:
+            contents += change
+        self.merge(client)
+
+    def text(self):
+        return str(self.doc.get("contents", type=Text))
 
     def update(self):
         return self.doc.get_update()
@@ -147,56 +163,114 @@ def test_file_list_is_capped():
     assert "- ... and 10 more files" in body
 
 
+def pending(actors, path_doc=DOC_ID):
+    return PendingFile(path_doc, RELAY_ID, {}, set(actors), "", None)
+
+
 class TestTracker:
     def setup_method(self):
         self.t = AuthorTracker()
-        self.relay = RelayDoc("start")
+        self.relay = RelayDoc("start\n")
 
     def observe_and_confirm(self, is_new_file=False):
         self.t.observe(RELAY_ID, DOC_ID, self.relay.doc)
-        return self.t.confirm("r/f", RELAY_ID, DOC_ID, "x.md", is_new_file=is_new_file)
+        return self.t.confirm(
+            "r/f", RELAY_ID, DOC_ID, "x.md", content=self.text(), is_new_file=is_new_file
+        )
+
+    def text(self):
+        return str(self.relay.doc.get("contents", type=Text))
+
+    def commit(self):
+        taken = self.t.take_for_commit("r/f", ["x.md"])
+        self.t.committed(taken.values())
+        return taken
 
     def test_first_sight_of_existing_file_claims_nobody(self):
         self.relay.edit(LUC, "human:Luc Brinkman", "a")
         assert self.observe_and_confirm() == set()
+        assert self.commit()["x.md"].owners is None
 
     def test_new_file_claims_all_registered_writers(self):
         self.relay.edit(LUC, "human:Luc Brinkman", "a")
         self.relay.edit(SERVER + 1, None, "b")
         assert self.observe_and_confirm(is_new_file=True) == {"human:Luc Brinkman"}
 
-    def test_only_clients_that_wrote_since_baseline(self):
+    def test_only_clients_that_wrote_since_the_last_commit(self):
         self.relay.edit(LUC, "human:Luc Brinkman", "a")
         self.observe_and_confirm()
+        self.commit()
         self.relay.edit(AI, "ai:opus-5.5:james", "b")
         assert self.observe_and_confirm() == {"ai:opus-5.5:james"}
+        self.commit()
         self.relay.edit(LUC, "human:Luc Brinkman", "c")
         assert self.observe_and_confirm() == {"human:Luc Brinkman"}
 
+    def test_exports_between_commits_accumulate(self):
+        self.observe_and_confirm()
+        self.commit()
+        self.relay.edit(LUC, "human:Luc Brinkman", "a")
+        self.observe_and_confirm()
+        self.relay.edit(AI, "ai:opus-5.5:james", "b")
+        assert self.observe_and_confirm() == {"human:Luc Brinkman", "ai:opus-5.5:james"}
+
+    def test_line_owners(self):
+        self.observe_and_confirm()
+        self.commit()
+        self.relay.edit(LUC, "human:Luc Brinkman", "Luc writes a line\n")
+        self.relay.edit(AI, "ai:opus-5.5:james", "AI line\n")
+        self.relay.edit(LUC, "human:Luc Brinkman", "x")  # a few chars on AI's... next line
+        self.observe_and_confirm()
+        owners = self.commit()["x.md"].owners
+        assert owners == [None, "human:Luc Brinkman", "ai:opus-5.5:james", "human:Luc Brinkman"]
+
     def test_failed_export_keeps_authors_for_retry(self):
         self.observe_and_confirm()
+        self.commit()
         self.relay.edit(LUC, "human:Luc Brinkman", "a")
         self.t.observe(RELAY_ID, DOC_ID, self.relay.doc)
         self.t.forget(RELAY_ID, DOC_ID)
         assert self.observe_and_confirm() == {"human:Luc Brinkman"}
 
+    def test_failed_commit_keeps_authors(self):
+        self.observe_and_confirm()
+        self.commit()
+        self.relay.edit(LUC, "human:Luc Brinkman", "a")
+        self.observe_and_confirm()
+        taken = self.t.take_for_commit("r/f", ["x.md"])
+        self.t.restore("r/f", taken)  # commit failed
+        assert self.commit()["x.md"].actors == {"human:Luc Brinkman"}
+
     def test_advance_moves_baseline_without_attributing(self):
         self.observe_and_confirm()
+        self.commit()
         self.relay.edit(LUC, "human:Luc Brinkman", "a")
         self.t.observe(RELAY_ID, DOC_ID, self.relay.doc)
         self.t.advance(RELAY_ID, DOC_ID)
         assert self.observe_and_confirm() == set()
 
-    def test_take_for_commit_keeps_later_writes_drops_stale(self):
-        self.t.restore("r/f", {"staged.md": {"a"}, "later.md": {"b"}, "stale.md": {"c"}})
-        taken = self.t.take_for_commit("r/f", ["staged.md"], ["later.md"])
-        assert taken == {"staged.md": {"a"}}
-        assert self.t.take_for_commit("r/f", ["later.md", "stale.md"]) == {"later.md": {"b"}}
+    def test_advance_keeps_uncommitted_authors(self):
+        self.observe_and_confirm()
+        self.commit()
+        self.relay.edit(LUC, "human:Luc Brinkman", "a")
+        self.observe_and_confirm()
+        self.t.observe(RELAY_ID, DOC_ID, self.relay.doc)
+        self.t.advance(RELAY_ID, DOC_ID)  # same content again, still uncommitted
+        assert self.commit()["x.md"].actors == {"human:Luc Brinkman"}
+
+    def test_take_for_commit_skips_rewritten_and_drops_stale(self):
+        self.t.restore(
+            "r/f",
+            {"staged.md": pending("a"), "later.md": pending("b"), "stale.md": pending("c")},
+        )
+        taken = self.t.take_for_commit("r/f", ["staged.md", "later.md"], ["later.md"])
+        assert set(taken) == {"staged.md"}
+        assert set(self.t.take_for_commit("r/f", ["later.md", "stale.md"])) == {"later.md"}
 
     def test_rename_carries_pending_authors(self):
-        self.t.restore("r/f", {"old.md": {"human:A"}})
+        self.t.restore("r/f", {"old.md": pending(["human:A"])})
         self.t.rename("r/f", "old.md", "new.md")
-        assert self.t.take_for_commit("r/f", ["old.md", "new.md"]) == {"new.md": {"human:A"}}
+        assert set(self.t.take_for_commit("r/f", ["old.md", "new.md"])) == {"new.md"}
 
     def test_saves_are_throttled_and_skipped_when_clean(self, tmp_path):
         state = str(tmp_path)
@@ -206,10 +280,12 @@ class TestTracker:
         assert not os.path.exists(path)  # nothing changed yet
         self.relay.edit(LUC, "human:Luc Brinkman", "a")
         self.observe_and_confirm()
+        self.commit()
         self.t.save(RELAY_ID, state)
         first = open(path).read()
         self.relay.edit(AI, "ai:opus-5.5:james", "b")
         self.observe_and_confirm()
+        self.commit()
         self.t.save(RELAY_ID, state)
         assert open(path).read() == first  # within the interval
         self.t.save(RELAY_ID, state, force=True)
@@ -222,6 +298,7 @@ class TestTracker:
         self.t.load(RELAY_ID, state)
         self.relay.edit(LUC, "human:Luc Brinkman", "a")
         self.observe_and_confirm()
+        self.commit()
         self.t.save(RELAY_ID, state)
 
         restarted = AuthorTracker()
@@ -235,7 +312,7 @@ class TestTracker:
 
 
 class TestCommitMessages:
-    """Webhook -> fetch -> export -> commit, with real pycrdt docs."""
+    """Webhook -> fetch -> export -> commit, with real pycrdt docs and git."""
 
     def setup_method(self):
         self.temp_dir = tempfile.mkdtemp()
@@ -243,7 +320,7 @@ class TestCommitMessages:
         self.relay_client = RelayClient("http://relay.test")
         self.relay_client.dm = MagicMock()
         self.docs = {
-            DOC_ID: RelayDoc("# Intro\n"),
+            DOC_ID: RelayDoc("# Intro\nOld line one\nOld line two\n"),
             DOC2_ID: RelayDoc("# Risks\n"),
             DOC3_ID: RelayDoc(),
         }
@@ -272,6 +349,7 @@ class TestCommitMessages:
         self.change(DOC_ID)
         self.change(DOC2_ID)
         assert self.pm.commit_changes()
+        self.start = self.repo.head.commit.hexsha
 
     def teardown_method(self):
         shutil.rmtree(self.temp_dir)
@@ -280,51 +358,138 @@ class TestCommitMessages:
         result = self.engine.process_document_change(RELAY_ID, doc_id, datetime.now(timezone.utc))
         assert result.success, result.error
 
-    def last_message(self):
-        return self.repo.head.commit.message
+    def new_commits(self):
+        """(author, subject) of every commit since setup, oldest first."""
+        out = self.repo.git.log("--reverse", "--format=%an|%cn|%s", f"{self.start}..HEAD")
+        return [tuple(line.split("|")) for line in out.splitlines()]
+
+    def blame(self, path):
+        """(author, line) for every line of ``path`` at HEAD."""
+        out = self.repo.git.blame("--line-porcelain", "HEAD", "--", path.lstrip("/"))
+        result, author = [], None
+        for line in out.splitlines():
+            if line.startswith("author "):
+                author = line[len("author ") :]
+            elif line.startswith("\t"):
+                result.append((author, line[1:]))
+        return result
+
+    def assert_head_matches_relay(self):
+        assert not self.repo.is_dirty(untracked_files=True)
+        for doc_id, path in ((DOC_ID, DOC_PATH), (DOC2_ID, DOC2_PATH)):
+            blob = self.repo.head.commit.tree / path.lstrip("/")
+            assert blob.data_stream.read().decode("utf-8") == self.docs[doc_id].text()
 
     def test_initial_export_names_nobody(self):
-        assert self.last_message().startswith("Auto-sync: ")
-        assert "Authors:" not in self.last_message()
+        message = self.repo.head.commit.message
+        assert message.startswith("Auto-sync: ") and "Authors:" not in message
 
-    def test_batched_commit_names_each_file_and_author(self):
-        self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "Welcome.\n")
+    def test_each_line_blames_its_author(self):
+        def luc(t):
+            t.insert(len("# Intro\n"), "Luc rewrote the intro.\n")
+
+        self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", luc)
         self.change(DOC_ID)
-        self.docs[DOC_ID].edit(AI, "ai:opus-5.5:james", "AI summary.\n")
+        self.docs[DOC_ID].edit(AI, "ai:opus-5.5:james", "AI added a summary.\n")
         self.change(DOC_ID)
         self.docs[DOC2_ID].edit(OBSIDIAN, "idheqwn0f6k0xxt", "From Obsidian.\n")
         self.change(DOC2_ID)
 
         assert self.pm.commit_changes()
-        message = self.last_message()
-        print(message)
-        lines = message.splitlines()
-        assert lines[0].startswith("Auto-sync: ")
-        assert lines[2:] == [
-            "Authors: ai:opus-5.5:james, Luc Brinkman, relay-user:idheqwn0f6k0xxt",
-            "",
-            "- Lens Edu/Lenses/Risks.md: relay-user:idheqwn0f6k0xxt",
-            "- Lens Edu/modules/Intro.md: ai:opus-5.5:james, Luc Brinkman",
-            "",
-            "Co-authored-by: ai:opus-5.5:james <ai-opus-5.5-james@relay.invalid>",
-            "Co-authored-by: Luc Brinkman <luc-brinkman@relay.invalid>",
-            "Co-authored-by: relay-user:idheqwn0f6k0xxt <relay-user-idheqwn0f6k0xxt@relay.invalid>",
+        print(self.repo.git.log(f"{self.start}..HEAD", "--format=%an <%ae>%n%B"))
+        print(self.repo.git.blame("HEAD", "--", DOC_PATH.lstrip("/")))
+        # One commit per author, committed by the bot; no leftover bot commit.
+        assert [(a, c) for a, c, _ in self.new_commits()] == [
+            ("ai:opus-5.5:james", "Relay Git Sync"),
+            ("Luc Brinkman", "Relay Git Sync"),
+            ("relay-user:idheqwn0f6k0xxt", "Relay Git Sync"),
         ]
-        # The git identity stays the bot's: the names are self-reported.
-        assert self.repo.head.commit.author.name == "Relay Git Sync"
+        assert self.blame(DOC_PATH) == [
+            ("Relay Git Sync", "# Intro"),
+            ("Luc Brinkman", "Luc rewrote the intro."),
+            ("Relay Git Sync", "Old line one"),
+            ("Relay Git Sync", "Old line two"),
+            ("ai:opus-5.5:james", "AI added a summary."),
+        ]
+        assert self.blame(DOC2_PATH)[-1] == ("relay-user:idheqwn0f6k0xxt", "From Obsidian.")
+        message = self.repo.git.log("-1", "--format=%B", self.new_commits_sha(1))
+        assert "Lines written since the last sync:\n- Lens Edu/modules/Intro.md: L2" in message
+        self.assert_head_matches_relay()
 
-        # Authors are consumed: the next commit only names its own writers.
-        self.docs[DOC2_ID].edit(AI, "ai:opus-5.5:james", "More.\n")
-        self.change(DOC2_ID)
+    def new_commits_sha(self, n):
+        return self.repo.git.log("--reverse", "--format=%H", f"{self.start}..HEAD").split()[n]
+
+    def test_concurrent_edits_in_one_hunk(self):
+        # Luc and the AI edit the same region at the same time, without
+        # seeing each other's change; Luc also deletes an old line.
+        doc = self.docs[DOC_ID]
+        luc = doc.fork(LUC, "human:Luc Brinkman")
+        ai = doc.fork(AI, "ai:opus-5.5:james")
+        lt = luc.get("contents", type=Text)
+        at = ai.get("contents", type=Text)
+        start = len("# Intro\n")
+        del lt[start : start + len("Old line one\n")]
+        lt.insert(start, "Luc A\nLuc B\n")
+        at.insert(start + len("Old line one\n"), "AI middle\n")
+        doc.merge(luc)
+        doc.merge(ai)
+        self.change(DOC_ID)
+
         assert self.pm.commit_changes()
-        assert "Authors: ai:opus-5.5:james\n" in self.last_message()
-        assert "Luc Brinkman" not in self.last_message()
+        blame = dict((line, author) for author, line in self.blame(DOC_PATH))
+        assert blame["Luc A"] == "Luc Brinkman" and blame["Luc B"] == "Luc Brinkman"
+        assert blame["AI middle"] == "ai:opus-5.5:james"
+        assert blame["Old line two"] == "Relay Git Sync"
+        assert "Old line one" not in blame
+        self.assert_head_matches_relay()
 
-    def test_server_only_writes_keep_the_plain_message(self):
+    def test_line_shared_by_two_authors_goes_to_the_main_writer(self):
+        self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "Luc wrote most of this")
+        self.docs[DOC_ID].edit(AI, "ai:opus-5.5:james", ", AI.\n")
+        self.change(DOC_ID)
+        assert self.pm.commit_changes()
+        assert self.blame(DOC_PATH)[-1] == ("Luc Brinkman", "Luc wrote most of this, AI.")
+
+    def test_unattributed_lines_arrive_in_a_closing_bot_commit(self):
+        self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "Luc line\n")
+        self.docs[DOC_ID].edit(SERVER + 7, None, "server line\n")
+        self.change(DOC_ID)
+        assert self.pm.commit_changes()
+        commits = self.new_commits()
+        assert [a for a, _, _ in commits] == ["Luc Brinkman", "Relay Git Sync"]
+        body = self.repo.head.commit.message
+        assert "Authors: Luc Brinkman" in body
+        assert self.blame(DOC_PATH)[-2:] == [
+            ("Luc Brinkman", "Luc line"),
+            ("Relay Git Sync", "server line"),
+        ]
+        self.assert_head_matches_relay()
+
+    def test_server_only_writes_keep_the_plain_commit(self):
         self.docs[DOC_ID].edit(SERVER + 7, None, "link index\n")
         self.change(DOC_ID)
         assert self.pm.commit_changes()
-        assert "Authors:" not in self.last_message()
+        assert [a for a, _, _ in self.new_commits()] == ["Relay Git Sync"]
+        assert "Authors:" not in self.repo.head.commit.message
+
+    def test_unreadable_doc_falls_back_to_per_file_authors(self, monkeypatch):
+        monkeypatch.setattr("authorship.character_ids", lambda update: None)
+        self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "x\n")
+        self.change(DOC_ID)
+        assert self.pm.commit_changes()
+        assert [a for a, _, _ in self.new_commits()] == ["Relay Git Sync"]
+        assert "- Lens Edu/modules/Intro.md: Luc Brinkman" in self.repo.head.commit.message
+
+    def test_git_failure_in_the_chain_falls_back_to_one_commit(self, monkeypatch):
+        monkeypatch.setattr(
+            "persistence._partial_text", MagicMock(side_effect=RuntimeError("boom"))
+        )
+        self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "x\n")
+        self.change(DOC_ID)
+        assert self.pm.commit_changes()
+        assert [a for a, _, _ in self.new_commits()] == ["Relay Git Sync"]
+        assert "Authors: Luc Brinkman" in self.repo.head.commit.message
+        self.assert_head_matches_relay()
 
     def test_attribution_failure_never_blocks_the_export(self):
         self.pm.authorship.observe = MagicMock(side_effect=RuntimeError("boom"))
@@ -332,18 +497,14 @@ class TestCommitMessages:
         self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "x\n")
         self.change(DOC_ID)
         assert self.pm.commit_changes()
-        assert "Authors:" not in self.last_message()
-        path = os.path.join(self.pm.get_folder_path(RELAY_ID, FOLDER_ID), DOC_PATH.lstrip("/"))
-        with open(path, encoding="utf-8") as f:
-            assert f.read().endswith("x\n")
+        assert "Authors:" not in self.repo.head.commit.message
+        self.assert_head_matches_relay()
 
     def test_first_export_via_webhook_credits_the_creator(self):
-        # The file was never exported; the doc webhook exports it through the
-        # update path, which must still treat it as a new file.
         self.docs[DOC3_ID].edit(LUC, "human:Luc Brinkman", "# New\n")
         self.change(DOC3_ID)
         assert self.pm.commit_changes()
-        assert "- Lens Edu/articles/New.md: Luc Brinkman" in self.last_message()
+        assert self.blame(DOC3_PATH) == [("Luc Brinkman", "# New")]
 
     def test_rename_before_commit_keeps_the_authors(self):
         self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "Welcome.\n")
@@ -351,7 +512,10 @@ class TestCommitMessages:
         resource = S3RemoteDocument(RELAY_ID, FOLDER_ID, DOC_ID)
         self.pm.move_file(resource, DOC_PATH, "/Lens Edu/modules/Introduction.md")
         assert self.pm.commit_changes()
-        assert "- Lens Edu/modules/Introduction.md: Luc Brinkman" in self.last_message()
+        assert "- Lens Edu/modules/Introduction.md: Luc Brinkman" in self.repo.head.commit.message
+        # Moved and edited in one tick: no line split (it would re-blame the
+        # whole file), the single commit names Luc for the file instead.
+        assert [a for a, _, _ in self.new_commits()] == ["Relay Git Sync"]
 
     def test_document_sync_request_path_is_attributed(self):
         self.docs[DOC_ID].edit(AI, "ai:opus-5.5:james", "AI line.\n")
@@ -361,10 +525,13 @@ class TestCommitMessages:
         )
         assert result.success, result.error
         assert self.pm.commit_changes()
-        assert "Authors: ai:opus-5.5:james\n" in self.last_message()
+        assert self.blame(DOC_PATH)[-1] == ("ai:opus-5.5:james", "AI line.")
 
         # The baseline moved: a later webhook export does not re-credit the AI.
         self.docs[DOC_ID].edit(LUC, "human:Luc Brinkman", "Luc line.\n")
         self.change(DOC_ID)
         assert self.pm.commit_changes()
-        assert "Authors: Luc Brinkman\n" in self.last_message()
+        assert self.blame(DOC_PATH)[-2:] == [
+            ("ai:opus-5.5:james", "AI line."),
+            ("Luc Brinkman", "Luc line."),
+        ]

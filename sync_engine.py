@@ -174,9 +174,7 @@ class SyncEngine:
                             else:
                                 # Export failed: keep the baseline so the
                                 # retry still attributes these changes.
-                                self.persistence_manager.authorship.forget(
-                                    relay_id, resource_id
-                                )
+                                self.persistence_manager.authorship.forget(relay_id, resource_id)
                         else:
                             # Already exported: nothing new reaches git.
                             self.persistence_manager.authorship.advance(relay_id, resource_id)
@@ -680,6 +678,7 @@ class SyncEngine:
                     relay_id,
                     doc_id,
                     self.persistence_manager.repo_relative_path(relay_id, folder_id, full_path),
+                    content=content,
                     is_new_file=is_new_file,
                 )
             except Exception as e:
