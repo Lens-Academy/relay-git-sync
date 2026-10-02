@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 STATE_VECTORS_FILE = "document_state_vectors.json"
 USERS_MAP_KEY = "users"
 MAX_FILE_LINES = 50
+# Bounds the message even if a doc's "users" map is flooded with names.
+MAX_AUTHORS = 20
 TRAILER_DOMAIN = "relay.invalid"
 # Baselines change on nearly every export; write them at most this often.
 # A crash loses at most this window, which only re-credits those writers once.
@@ -136,15 +138,17 @@ def format_authors_body(changes: Dict[str, Set[str]]) -> str:
             labels[actor] = _clean(display_actor(actor)) or "unknown"
     ordered = sorted(set(labels.values()), key=str.lower)
 
-    lines: List[str] = [f"Authors: {', '.join(ordered)}", ""]
+    shown = ordered[:MAX_AUTHORS]
+    more = f" and {len(ordered) - MAX_AUTHORS} more" if len(ordered) > MAX_AUTHORS else ""
+    lines: List[str] = [f"Authors: {', '.join(shown)}{more}", ""]
     paths = sorted(changes)
     for path in paths[:MAX_FILE_LINES]:
-        names = sorted({labels[a] for a in changes[path]}, key=str.lower)
+        names = sorted({labels[a] for a in changes[path]}, key=str.lower)[:MAX_AUTHORS]
         lines.append(f"- {_clean(path)}: {', '.join(names)}")
     if len(paths) > MAX_FILE_LINES:
         lines.append(f"- ... and {len(paths) - MAX_FILE_LINES} more files")
     lines.append("")
-    lines.extend(_trailer(label) for label in ordered)
+    lines.extend(_trailer(label) for label in shown)
     return "\n".join(lines)
 
 

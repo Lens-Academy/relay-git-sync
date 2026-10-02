@@ -134,6 +134,12 @@ def test_name_that_cleans_to_nothing_shows_unknown():
     assert "Co-authored-by: unknown <unknown@relay.invalid>" in body
 
 
+def test_author_list_is_capped():
+    body = format_authors_body({"a.md": {f"human:N{i:02}" for i in range(25)}})
+    assert body.splitlines()[0].endswith("N19 and 5 more")
+    assert sum(line.startswith("Co-authored-by:") for line in body.splitlines()) == 20
+
+
 def test_file_list_is_capped():
     body = format_authors_body({f"f{i:03}.md": {"human:A"} for i in range(60)})
     assert "- f049.md: A" in body
