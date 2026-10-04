@@ -39,6 +39,16 @@ class OperationsQueue:
         self._retry_lock = threading.Lock()
         self._pending_retries: Dict[Tuple[str, str], dict] = {}
 
+        # Document changes waiting in request_queue and not yet taken by the
+        # worker, keyed by (relay_id, resource_id). A repeat event for a key
+        # already waiting is folded into the waiting one instead of queued
+        # again: the worker fetches the resource's current state when it
+        # processes the event, so one pass covers every change before it.
+        # The key is released the moment the worker takes the event, so a
+        # change arriving during processing is still queued once more.
+        self._pending_lock = threading.Lock()
+        self._pending_changes: Dict[Tuple[str, str], dict] = {}
+
         # Start worker thread and git commit timer
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
@@ -72,7 +82,45 @@ class OperationsQueue:
             self._pending_retries.pop(
                 (change_data["relay_id"], change_data["resource_id"]), None
             )
-        self.request_queue.put(change_data)
+        if not self._put_document_change(change_data):
+            print(
+                f"Coalesced document change for relay: {change_data['relay_id']}, resource: {change_data['resource_id']} into the one already queued"
+            )
+
+    def _put_document_change(self, change_data: dict, supersede: bool = True) -> bool:
+        """Queue a document change unless one for the same resource is waiting.
+
+        Returns True if queued. When an event for the key is already waiting,
+        nothing new is queued; with supersede=True (a fresh webhook) the
+        waiting event takes the newer timestamp and drops any retry count, so
+        a failure starts the backoff schedule over. Retries pass
+        supersede=False: the waiting event is at least as fresh.
+        """
+        key = (change_data["relay_id"], change_data["resource_id"])
+        with self._pending_lock:
+            waiting = self._pending_changes.get(key)
+            if waiting is not None:
+                if supersede:
+                    waiting["timestamp"] = change_data["timestamp"]
+                    waiting.pop("_retry_attempt", None)
+                return False
+            self._pending_changes[key] = change_data
+            # put() inside the lock: the worker's release (also under the
+            # lock) can never see the queued item before the key is recorded.
+            self.request_queue.put(change_data)
+            return True
+
+    def _release_document_change(self, change_data: dict):
+        """Called when the worker takes a change: later events queue again."""
+        key = (change_data["relay_id"], change_data["resource_id"])
+        with self._pending_lock:
+            if self._pending_changes.get(key) is change_data:
+                del self._pending_changes[key]
+
+    def get_pending_change_count(self) -> int:
+        """Number of distinct document changes waiting for the worker."""
+        with self._pending_lock:
+            return len(self._pending_changes)
 
     def _worker_loop(self):
         """Main worker loop that processes sync requests"""
@@ -85,6 +133,9 @@ class OperationsQueue:
                 if isinstance(request, SyncRequest):
                     result = self._process_with_state_management(request)
                 elif isinstance(request, dict) and "relay_id" in request:
+                    # Release the key before processing: an event arriving
+                    # while this one runs may carry changes this fetch misses.
+                    self._release_document_change(request)
                     # Handle document change data with individual UUIDs
                     result = self.sync_engine.process_document_change(
                         request["relay_id"],
@@ -199,7 +250,8 @@ class OperationsQueue:
             due_keys = [k for k, v in self._pending_retries.items() if v["due_at"] <= now]
             due = [self._pending_retries.pop(k)["change_data"] for k in due_keys]
         for change_data in due:
-            self.request_queue.put(change_data)
+            # A fresh event already waiting for this resource covers the retry.
+            self._put_document_change(change_data, supersede=False)
 
     def _retry_timer_loop(self):
         """Background timer that re-enqueues due retries.
