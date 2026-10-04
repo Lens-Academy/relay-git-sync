@@ -11,7 +11,7 @@ from operations_queue import OperationsQueue
 from web_server import create_server
 
 from http_timeout import install_default_timeout
-from log_redaction import install_log_redaction
+from log_redaction import install_log_redaction, redact
 
 install_default_timeout()
 
@@ -59,7 +59,9 @@ def startup_sync_all_folders(sync_engine, persistence_manager):
                             print(f"  ✓ Folder {result.folder_id} up to date")
                     else:
                         total_failed += 1
-                        print(f"  ✗ Failed to sync folder {result.folder_id}: {result.error}")
+                        # result.error is str(e) from the sync engine and may
+                        # carry a credential-bearing URL (see log_redaction.py).
+                        print(redact(f"  ✗ Failed to sync folder {result.folder_id}: {result.error}"))
 
             except Exception as e:
                 logger.warning(f"Error syncing relay {relay_id} during startup: {e}")

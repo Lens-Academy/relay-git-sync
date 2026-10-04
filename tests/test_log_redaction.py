@@ -60,6 +60,14 @@ class TestRedactUrlUserinfo:
         text = "Fetching https://relay-server:8080/f/doc/download-url"
         assert redact(text) == text
 
+    def test_masks_through_last_at_when_password_contains_at(self):
+        # A naive non-greedy/negated-class match stops at the *first* '@',
+        # leaking the rest of a password that itself contains '@'.
+        text = "clone failed https://user:p@ssw0rd@github.com/org/repo.git"
+        redacted = redact(text)
+        assert "p@ssw0rd" not in redacted
+        assert redacted == "clone failed https://***@github.com/org/repo.git"
+
 
 class TestRedactBearerToken:
     def test_masks_authorization_header_line(self):
@@ -82,6 +90,28 @@ class TestRedactTokenQueryParam:
         text = "GET /oauth/callback?access_token=supersecret456"
         assert redact(text) == "GET /oauth/callback?access_token=***"
 
+    def test_masks_aws_presigned_url_params(self):
+        # relay_client.py's S3 file download hits a presigned URL; on
+        # failure the exception's "for url: ..." text includes these.
+        text = (
+            "404 Client Error: Not Found for url: "
+            "https://bucket.s3.amazonaws.com/key"
+            "?X-Amz-Credential=AKIAREALCREDENTIAL%2F20261004"
+            "&X-Amz-Signature=realsignaturevalue123"
+            "&X-Amz-Security-Token=realsecuritytoken456"
+        )
+        redacted = redact(text)
+        assert "AKIAREALCREDENTIAL" not in redacted
+        assert "realsignaturevalue123" not in redacted
+        assert "realsecuritytoken456" not in redacted
+        assert "X-Amz-Credential=***" in redacted
+        assert "X-Amz-Signature=***" in redacted
+        assert "X-Amz-Security-Token=***" in redacted
+
+    def test_masks_client_secret_param(self):
+        text = "POST /token?client_secret=abcSecretXyz&grant_type=client_credentials"
+        assert redact(text) == "POST /token?client_secret=***&grant_type=client_credentials"
+
 
 class TestRedactKnownSecrets:
     def test_masks_exact_env_secret_without_wrapper(self, clean_secret_env, monkeypatch):
@@ -94,11 +124,30 @@ class TestRedactKnownSecrets:
         text = "clone failed: myRegisteredGithubToken rejected by remote"
         assert redact(text) == "clone failed: *** rejected by remote"
 
-    def test_register_secret_from_url_extracts_username_and_password(self):
+    def test_register_secret_from_url_extracts_bare_token_username(self):
         register_secret_from_url("https://ghp_extracted@github.com/example/repo.git")
         # The pattern-based userinfo mask already catches this inside a URL;
         # exercise the exact-match path by looking for the bare token.
         assert redact("token was ghp_extracted") == "token was ***"
+
+    def test_register_secret_from_url_prefers_password_over_username(self):
+        # https://oauth2:TOKEN@host and https://x-access-token:TOKEN@host are
+        # the common "fixed role name as username, real secret as password"
+        # forms (GitLab deploy tokens, GitHub App installation tokens). Only
+        # the password should be registered - see next test for why.
+        register_secret_from_url("https://oauth2:realSecretValue@gitlab.com/org/repo.git")
+        assert redact("leaked realSecretValue here") == "leaked *** here"
+        assert "oauth2" not in log_redaction._registered_secrets
+
+    def test_register_secret_from_url_skips_ssh_fixed_username(self):
+        # git@github.com:org/repo.git-style URLs (and ssh:// URLs) use the
+        # fixed, non-secret username "git" by SSH convention - registering
+        # it as an exact-match secret would mask that word everywhere.
+        register_secret_from_url("ssh://git@github.com/example/repo.git")
+        assert log_redaction._registered_secrets == []
+        assert redact("Initialized git repository with .gitignore") == (
+            "Initialized git repository with .gitignore"
+        )
 
     def test_register_secret_ignores_empty_values(self):
         register_secret(None)

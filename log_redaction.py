@@ -45,13 +45,22 @@ from urllib.parse import urlparse
 _MASK = "***"
 
 # scheme://user:pass@ or scheme://token@ -> scheme://***@
-_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://)[^\s/@]+@")
+# [^/\s]* is greedy, so on "user:p@ss@host" it backtracks to the *last* '@'
+# before the next '/' or whitespace - i.e. the end of the authority's
+# userinfo - rather than stopping at a '@' that is itself part of the
+# password.
+_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/\s]*@")
 # Bearer <token> -> Bearer *** (covers "Authorization: Bearer x" and dict
 # reprs like {'Authorization': 'Bearer x'} alike, since "Bearer" is already
 # an unambiguous signal)
 _BEARER_RE = re.compile(r"(?i)(\bBearer\s+)([^\s'\"]+)")
-# ?token=... / &token=... / ?access_token=... -> ...=***
-_TOKEN_QUERY_RE = re.compile(r"(?i)([?&](?:access_)?token=)[^&\s'\"]+")
+# Query params whose key signals a credential: ?token=, &access_token=,
+# ?client_secret=, and AWS SigV4 presigned-URL params (X-Amz-Signature,
+# X-Amz-Credential, X-Amz-Security-Token all contain "token"/"signature"/
+# "credential") -> ...=***
+_SENSITIVE_QUERY_RE = re.compile(
+    r"(?i)([?&][\w.-]*(?:token|signature|credential|secret)[\w.-]*=)[^&\s'\"]+"
+)
 
 _KNOWN_SECRET_ENV_VARS = (
     "RELAY_SERVER_API_KEY",
@@ -76,20 +85,32 @@ def register_secret(value: Optional[str]) -> None:
 
 
 def register_secret_from_url(url: Optional[str]) -> None:
-    """Pull a userinfo-embedded token/password out of `url` (if any) and
-    register it by exact value too - a backstop for the rare case where it
-    later shows up outside a scheme://...@ context (e.g. a bare value in a
-    GitPython exception's extra-output section)."""
+    """Pull a userinfo-embedded token out of `url` (if any) and register it
+    by exact value too - a backstop for the rare case where it later shows
+    up outside a scheme://...@ context (e.g. a bare value in a GitPython
+    exception's extra-output section).
+
+    Only http(s)/y-sweet URLs are considered: an ssh:// URL's "username" is
+    a fixed, non-secret convention (git@github.com uses the literal user
+    "git"), not a credential, and registering it would mask that word
+    everywhere. When the URL has both a username and a password
+    (https://oauth2:TOKEN@host, https://x-access-token:TOKEN@host), the
+    username is conventionally a fixed non-secret role name and the
+    password is the actual secret, so only the password is registered;
+    with no password (https://TOKEN@host) the username is the token.
+    """
     if not url:
         return
     try:
         parsed = urlparse(url)
     except ValueError:
         return
-    if parsed.username:
-        register_secret(parsed.username)
+    if parsed.scheme not in ("http", "https", "ys", "yss"):
+        return
     if parsed.password:
         register_secret(parsed.password)
+    elif parsed.username:
+        register_secret(parsed.username)
 
 
 def _known_secrets() -> List[str]:
@@ -105,7 +126,7 @@ def redact(text: Optional[str]) -> Optional[str]:
         return text
     redacted = _USERINFO_RE.sub(lambda m: f"{m.group(1)}{_MASK}@", text)
     redacted = _BEARER_RE.sub(lambda m: f"{m.group(1)}{_MASK}", redacted)
-    redacted = _TOKEN_QUERY_RE.sub(lambda m: f"{m.group(1)}{_MASK}", redacted)
+    redacted = _SENSITIVE_QUERY_RE.sub(lambda m: f"{m.group(1)}{_MASK}", redacted)
     for secret in _known_secrets():
         if secret and secret in redacted:
             redacted = redacted.replace(secret, _MASK)

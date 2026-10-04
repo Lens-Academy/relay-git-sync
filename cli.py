@@ -85,7 +85,9 @@ def sync_command(args):
                 else:
                     print("No changes detected")
             else:
-                print(f"Sync failed: {result.error}")
+                # result.error is str(e) from the sync engine and may carry a
+                # credential-bearing URL (see log_redaction.py).
+                print(redact(f"Sync failed: {result.error}"))
                 return 1
 
         else:
@@ -104,7 +106,7 @@ def sync_command(args):
                         total_operations += operation_count
                         print(f"  {operation_count} operations performed")
                 else:
-                    print(f"✗ Failed to sync folder {result.folder_id}: {result.error}")
+                    print(redact(f"✗ Failed to sync folder {result.folder_id}: {result.error}"))
                     failed_syncs += 1
 
             print(f"\nSync complete:")
