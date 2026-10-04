@@ -11,11 +11,13 @@ from operations_queue import OperationsQueue
 from web_server import create_server
 
 from http_timeout import install_default_timeout
+from log_redaction import install_log_redaction
 
 install_default_timeout()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+install_log_redaction()
 logger = logging.getLogger(__name__)
 
 

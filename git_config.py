@@ -6,6 +6,8 @@ from typing import List, Dict, Optional, Any
 from dataclasses import dataclass
 from pathlib import Path
 
+from log_redaction import register_secret_from_url
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -90,6 +92,11 @@ class GitConnectorConfig:
                         prefix=connector_data.get("prefix", ""),
                     )
                     self.connectors.append(connector)
+                    # A private-repo URL may embed a token/password
+                    # (https://<token>@github.com/...); register it as an
+                    # exact-match secret too, as a backstop for the pattern
+                    # based URL/Bearer masking (see log_redaction.py).
+                    register_secret_from_url(connector.url)
                     logger.info(
                         f"Loaded git connector: relay={connector.relay_id}, "
                         f"folder={connector.shared_folder_id}, url={connector.url}"
@@ -125,6 +132,7 @@ class GitConnectorConfig:
             )
         ]
         self.connectors.append(connector)
+        register_secret_from_url(connector.url)
 
     def remove_connector(self, relay_id: str, folder_id: str) -> bool:
         """Remove a git connector configuration"""

@@ -15,11 +15,13 @@ from persistence import PersistenceManager, SSHKeyManager
 from sync_engine import SyncEngine
 from s3rn import S3RemoteFolder
 from git_config import GitConnectorConfig, GitConnector
+from log_redaction import install_log_redaction, redact
 
 install_default_timeout()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+install_log_redaction()
 logger = logging.getLogger(__name__)
 
 
@@ -230,7 +232,7 @@ def git_connector_list_command(args):
         for i, connector in enumerate(git_config.connectors, 1):
             print(f"{i}. Relay: {connector.relay_id}")
             print(f"   Folder: {connector.shared_folder_id}")
-            print(f"   URL: {connector.url}")
+            print(redact(f"   URL: {connector.url}"))
             print(f"   Branch: {connector.branch}")
             print(f"   Remote: {connector.remote_name}")
             print(f"   Prefix: {connector.prefix or '(root)'}")
@@ -265,7 +267,7 @@ def git_connector_add_command(args):
         print("Git connector added successfully:")
         print(f"  Relay ID: {connector.relay_id}")
         print(f"  Folder ID: {connector.shared_folder_id}")
-        print(f"  URL: {connector.url}")
+        print(redact(f"  URL: {connector.url}"))
         print(f"  Branch: {connector.branch}")
         print(f"  Remote: {connector.remote_name}")
         print(f"  Prefix: {connector.prefix or '(root)'}")
@@ -346,7 +348,7 @@ def git_connector_validate_command(args):
         else:
             print("✗ Git connector configuration has errors:")
             for error in errors:
-                print(f"  - {error}")
+                print(redact(f"  - {error}"))
             return 1
 
     except Exception as e:
@@ -377,7 +379,7 @@ def git_connector_sync_command(args):
                         connector.relay_id, connector.shared_folder_id
                     )
                     print(f"  - {repo_key} -> {folder_path}")
-                    print(f"    Remote: {connector.remote_name} = {connector.url}")
+                    print(redact(f"    Remote: {connector.remote_name} = {connector.url}"))
         else:
             print("No new repositories created (may already exist)")
 

@@ -652,7 +652,11 @@ class PersistenceManager:
             if connector and connector.url:
                 # Clone from remote
                 try:
-                    print(f"Cloning repository from {connector.url} for folder {folder_id}")
+                    # logger, not print: this is a live sync-path message and a
+                    # credential may be embedded in connector.url (see
+                    # log_redaction.py); print() bypasses the logging filter
+                    # that masks it.
+                    logger.info(f"Cloning repository from {connector.url} for folder {folder_id}")
                     self.git_repos[repo_key] = git.Repo.clone_from(
                         connector.url, folder_path, branch=connector.branch
                     )
