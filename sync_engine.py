@@ -645,8 +645,13 @@ class SyncEngine:
 
     def _mark_missing(self, document_resource: S3RNType):
         key = (S3RN.get_relay_id(document_resource), document_resource.get_resource_id())
+        now = time.monotonic()
         with self._missing_docs_lock:
-            self._missing_docs[key] = time.monotonic() + self.MISSING_DOC_TTL
+            # Prune expired entries here too: a doc that left filemeta is never
+            # looked up again, so lazy expiry alone would leak its entry.
+            for k in [k for k, until in self._missing_docs.items() if until <= now]:
+                del self._missing_docs[k]
+            self._missing_docs[key] = now + self.MISSING_DOC_TTL
 
     def _forget_missing_doc(self, relay_id: str, doc_id: str):
         with self._missing_docs_lock:

@@ -270,3 +270,11 @@ class TestMissingDocCache(EngineHarness):
         assert self.engine._is_known_missing(
             S3RemoteCanvas(RELAY_ID, FOLDER_ID, canvas_id)
         )
+
+    def test_expired_entries_are_pruned_on_insert(self):
+        gone = (RELAY_ID, "66666666-6666-4666-8666-666666666666")
+        with self.engine._missing_docs_lock:
+            self.engine._missing_docs[gone] = time.monotonic() - 1
+        self.sweep()  # marks DOC_ID missing
+        assert gone not in self.engine._missing_docs
+        assert (RELAY_ID, DOC_ID) in self.engine._missing_docs
