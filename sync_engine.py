@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 class SyncEngine:
     """Core synchronization logic for Y-Sweet documents to Git repositories"""
 
+    # How long a folder sweep skips re-fetching a doc whose fetch came back
+    # empty (deleted on the relay but still listed in filemeta). Every folder
+    # event used to re-fetch such docs (~1.5 s each) only to log "document
+    # not found" again. A webhook for the doc itself, or a forced reconcile
+    # sweep, clears the entry early.
+    MISSING_DOC_TTL = 600
+
     def __init__(
         self,
         data_dir: str,
@@ -39,6 +46,9 @@ class SyncEngine:
         self.relay_client = relay_client
         self.persistence_manager = persistence_manager or PersistenceManager(data_dir)
         self.folder_sync_locks: Dict[str, threading.Lock] = {}
+        # (relay_id, doc_id) -> monotonic time until which sweeps skip fetching
+        self._missing_docs: Dict[Tuple[str, str], float] = {}
+        self._missing_docs_lock = threading.Lock()
         # Every exported content doc passes through the author tracker
         self.relay_client.doc_observer = self.persistence_manager.authorship.observe
 
@@ -51,6 +61,10 @@ class SyncEngine:
 
             # Ensure relay data is loaded
             self.persistence_manager.load_persistent_data(relay_id)
+
+            # A webhook naming this doc means it exists (again): let the next
+            # folder sweep fetch it instead of trusting a cached "not found".
+            self._forget_missing_doc(relay_id, resource_id)
 
             # Check if this is a known folder
             if resource_id in self.persistence_manager.filemeta_folders.get(relay_id, {}):
@@ -208,6 +222,10 @@ class SyncEngine:
 
             # Ensure relay data is loaded
             self.persistence_manager.load_persistent_data(relay_id)
+
+            if request.force:
+                # Reconcile sweep: re-check every doc, cached misses included.
+                self._clear_missing_docs(relay_id)
 
             # Get document structure
             doc, parsed_content = self.relay_client.get_document_structure(resource)
@@ -614,6 +632,52 @@ class SyncEngine:
             metadata=metadata,
         )
 
+    def _is_known_missing(self, document_resource: S3RNType) -> bool:
+        key = (S3RN.get_relay_id(document_resource), document_resource.get_resource_id())
+        with self._missing_docs_lock:
+            until = self._missing_docs.get(key)
+            if until is None:
+                return False
+            if time.monotonic() >= until:
+                del self._missing_docs[key]
+                return False
+            return True
+
+    def _mark_missing(self, document_resource: S3RNType):
+        key = (S3RN.get_relay_id(document_resource), document_resource.get_resource_id())
+        now = time.monotonic()
+        with self._missing_docs_lock:
+            # Prune expired entries here too: a doc that left filemeta is never
+            # looked up again, so lazy expiry alone would leak its entry.
+            for k in [k for k, until in self._missing_docs.items() if until <= now]:
+                del self._missing_docs[k]
+            self._missing_docs[key] = now + self.MISSING_DOC_TTL
+
+    def _forget_missing_doc(self, relay_id: str, doc_id: str):
+        with self._missing_docs_lock:
+            self._missing_docs.pop((relay_id, doc_id), None)
+
+    def _clear_missing_docs(self, relay_id: str):
+        with self._missing_docs_lock:
+            for key in [k for k in self._missing_docs if k[0] == relay_id]:
+                del self._missing_docs[key]
+
+    def _fetch_text_for_sweep(self, document_resource: S3RNType) -> Optional[str]:
+        """Fetch a doc or canvas for a folder-sweep create/update.
+
+        None means not found (or unfetchable); the doc is then skipped without
+        a fetch for MISSING_DOC_TTL seconds.
+        """
+        if self._is_known_missing(document_resource):
+            return None
+        if isinstance(document_resource, S3RemoteCanvas):
+            content = self.relay_client.fetch_canvas_content(document_resource)
+        else:
+            content = self.relay_client.fetch_document_content(document_resource)
+        if content is None:
+            self._mark_missing(document_resource)
+        return content
+
     def should_update_file(
         self, relay_id: str, doc_id: str, metadata: Dict, full_path: str, force: bool = False
     ) -> bool:
@@ -768,7 +832,7 @@ class SyncEngine:
             )
         elif isinstance(document_resource, S3RemoteCanvas):
             # Canvas content as JSON
-            content = self.relay_client.fetch_canvas_content(document_resource)
+            content = self._fetch_text_for_sweep(document_resource)
 
             # If content fetch failed (e.g., 404), skip this operation
             if content is None:
@@ -784,7 +848,7 @@ class SyncEngine:
             self._record_exported_hash(document_resource, content, full_path, is_new_file=True)
         else:
             # Regular document/text content
-            content = self.relay_client.fetch_document_content(document_resource)
+            content = self._fetch_text_for_sweep(document_resource)
 
             # If content fetch failed (e.g., 404), skip this operation
             if content is None:
@@ -851,7 +915,7 @@ class SyncEngine:
             # Canvas content as JSON
             content = operation.content
             if content is None:
-                content = self.relay_client.fetch_canvas_content(document_resource)
+                content = self._fetch_text_for_sweep(document_resource)
 
             if content is not None:
                 # Write canvas JSON using persistence manager
@@ -871,7 +935,7 @@ class SyncEngine:
             # Use provided content or fetch from remote for documents
             content = operation.content
             if content is None:
-                content = self.relay_client.fetch_document_content(document_resource)
+                content = self._fetch_text_for_sweep(document_resource)
 
             if content is not None:
                 # Write file using persistence manager
