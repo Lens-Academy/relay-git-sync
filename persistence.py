@@ -652,7 +652,11 @@ class PersistenceManager:
             if connector and connector.url:
                 # Clone from remote
                 try:
-                    print(f"Cloning repository from {connector.url} for folder {folder_id}")
+                    # logger, not print: this is a live sync-path message and a
+                    # credential may be embedded in connector.url (see
+                    # log_redaction.py); print() bypasses the logging filter
+                    # that masks it.
+                    logger.info(f"Cloning repository from {connector.url} for folder {folder_id}")
                     self.git_repos[repo_key] = git.Repo.clone_from(
                         connector.url, folder_path, branch=connector.branch
                     )
@@ -705,13 +709,16 @@ class PersistenceManager:
                 # Update existing remote URL
                 remote = git_repo.remotes[remote_name]
                 remote.set_url(remote_url)
-                print(
+                # logger, not print: remote_url may carry an embedded
+                # credential (see log_redaction.py); print() bypasses the
+                # logging filter that masks it.
+                logger.info(
                     f"Updated remote '{remote_name}' URL for folder {folder_id} in relay {relay_id}: {remote_url}"
                 )
             else:
                 # Add new remote
                 git_repo.create_remote(remote_name, remote_url)
-                print(
+                logger.info(
                     f"Added remote '{remote_name}' for folder {folder_id} in relay {relay_id}: {remote_url}"
                 )
 
