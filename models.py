@@ -69,6 +69,20 @@ def get_s3rn_resource_category(resource_type: str) -> str:
         return "file"
 
 
+def effective_resource_type(metadata: Dict) -> Optional[str]:
+    """The metadata type, except that a hashless "file" entry is a text document.
+
+    Relay gives every text document whose path does not end in .md (the
+    editor's .html pages) type "file" without a hash. Real blobs always carry
+    the hash of their content, so a missing hash means the content is the
+    Y.Doc's text, to be exported like a Markdown document.
+    """
+    resource_type = metadata.get("type")
+    if resource_type == ResourceType.FILE.value and not metadata.get("hash"):
+        return ResourceType.MARKDOWN.value
+    return resource_type
+
+
 def create_document_resource_from_metadata(
     relay_id: str, folder_id: str, metadata: Dict
 ) -> "S3RNType":
@@ -80,7 +94,7 @@ def create_document_resource_from_metadata(
     if not doc_id:
         raise ValueError(f"Missing 'id' field in metadata: {metadata}")
 
-    resource_type = metadata.get("type")
+    resource_type = effective_resource_type(metadata)
     if not resource_type:
         raise ValueError(f"Missing 'type' field in metadata: {metadata}")
 
