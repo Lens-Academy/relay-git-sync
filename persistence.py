@@ -27,7 +27,7 @@ from authorship import (
     format_authors_body,
 )
 from git_config import GitConnectorConfig
-from models import get_s3rn_resource_category
+from models import effective_resource_type, get_s3rn_resource_category
 from s3rn import (
     S3RN,
     ResourceInterface,
@@ -1623,7 +1623,7 @@ class PersistenceManager:
 
                         # Only add if not already in index (local_file_state takes precedence)
                         if resource_id not in relay_index:
-                            resource_type = metadata.get("type", "document")
+                            resource_type = effective_resource_type(metadata) or "document"
                             relay_index[resource_id] = {
                                 "type": resource_type,
                                 "folder_id": folder_id,
@@ -1682,7 +1682,7 @@ class PersistenceManager:
                 self.resource_index[relay_id] = {}
 
             # Use metadata type directly, no extension-based inference
-            resource_type = metadata.get("type", "unknown")
+            resource_type = effective_resource_type(metadata) or "unknown"
 
             self.resource_index[relay_id][resource_id] = {
                 "type": resource_type,
