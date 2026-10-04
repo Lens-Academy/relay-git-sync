@@ -10,6 +10,7 @@ from y_sweet_sdk import DocumentManager
 from pycrdt import Doc, Text, Map
 from s3rn import S3RNType, S3RN, S3RemoteFolder, S3RemoteDocument, S3RemoteFile, S3RemoteCanvas
 from models import ResourceType, get_s3rn_resource_category
+from log_redaction import register_secret
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,12 @@ class RelayClient:
     def __init__(self, relay_server_url: str, relay_server_api_key: Optional[str] = None):
         self.relay_server_url = relay_server_url
         self.relay_server_api_key = relay_server_api_key
+        # Covers the --relay-server-api-key CLI flag, not just the
+        # RELAY_SERVER_API_KEY env var that log_redaction.py reads directly -
+        # the pattern-based URL/Bearer masking already catches this key
+        # wherever it's embedded, but this keeps the exact-match backstop
+        # live regardless of how the key reached us.
+        register_secret(relay_server_api_key)
         self.dm = self._init_document_manager()
         # Optional callback(relay_id, doc_id, doc) for every content doc
         # fetched for export; used to attribute changes (see authorship.py).

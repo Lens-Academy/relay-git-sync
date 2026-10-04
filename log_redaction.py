@@ -150,10 +150,21 @@ class RedactingFilter(logging.Filter):
 
 
 class _RedactingFormatter(logging.Formatter):
-    """Wraps another Formatter and masks its fully rendered output,
-    including any exception traceback it appended - the backstop for
-    secrets that only appear once exc_info is formatted (formatException),
-    independent of the message-level RedactingFilter above."""
+    """Wraps another Formatter and masks its fully rendered output.
+
+    `inner.format(record)` does the normal work, including calling its own
+    `formatException`/`formatStack` to render and cache any traceback onto
+    `record.exc_text` - we don't need to override those ourselves, since the
+    single `redact()` call below runs on the complete string those produce,
+    message and traceback alike. This is the backstop for secrets that only
+    appear once exc_info is formatted, independent of the message-level
+    RedactingFilter above (which runs before formatting, so it can't see
+    traceback text).
+
+    Only covers handlers this has actually been installed on - a handler
+    added to the logger later, without going through install_log_redaction()
+    again, is not wrapped and will format unredacted.
+    """
 
     def __init__(self, inner: logging.Formatter):
         super().__init__()
@@ -161,12 +172,6 @@ class _RedactingFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         return redact(self._inner.format(record))
-
-    def formatException(self, ei) -> str:
-        return redact(self._inner.formatException(ei))
-
-    def formatStack(self, stack_info) -> str:
-        return redact(self._inner.formatStack(stack_info))
 
 
 def install_log_redaction(logger: Optional[logging.Logger] = None) -> None:

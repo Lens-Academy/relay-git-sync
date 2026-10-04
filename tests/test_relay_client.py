@@ -2,6 +2,8 @@
 
 import pytest
 from relay_client import RelayClient
+import log_redaction
+from log_redaction import redact
 
 
 class TestRelayClientIdExtraction:
@@ -70,7 +72,34 @@ class TestRelayClientIdExtraction:
         
         # Test with 12 parts (not divisible by 5)
         compound_id = "12345678-1234-1234-1234-123456789abc-87654321-4321-4321-4321-cba987654321-extra"
-        
+
         with pytest.raises(ValueError) as exc_info:
             RelayClient.create_folder_resource_from_compound_id(compound_id)
         assert "2 or 3 complete UUIDs" in str(exc_info.value)
+
+
+class TestRelayClientSecretRegistration:
+    """A relay API key handed in via --relay-server-api-key (not the
+    RELAY_SERVER_API_KEY env var log_redaction.py reads directly) still
+    needs to land in the exact-match redaction backstop."""
+
+    def test_api_key_from_constructor_is_registered_for_redaction(self):
+        original = list(log_redaction._registered_secrets)
+        log_redaction._registered_secrets.clear()
+        try:
+            RelayClient("https://relay.example.com", "cliSuppliedRelayKey999")
+            assert "cliSuppliedRelayKey999" in log_redaction._registered_secrets
+            assert redact("key was cliSuppliedRelayKey999") == "key was ***"
+        finally:
+            log_redaction._registered_secrets.clear()
+            log_redaction._registered_secrets.extend(original)
+
+    def test_no_api_key_registers_nothing(self):
+        original = list(log_redaction._registered_secrets)
+        log_redaction._registered_secrets.clear()
+        try:
+            RelayClient("https://relay.example.com")
+            assert log_redaction._registered_secrets == []
+        finally:
+            log_redaction._registered_secrets.clear()
+            log_redaction._registered_secrets.extend(original)
